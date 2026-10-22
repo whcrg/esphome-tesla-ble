@@ -48,7 +48,8 @@ api:
 
 packages:
   remote_package_files:
-    url: https://github.com/PedroKTFC/esphome-tesla-ble/
+    url: https://github.com/whcrg/esphome-tesla-ble/
+    ref: schedules-and-preconditioning
     files:
       - packages/base.yml
       - packages/common.yml
