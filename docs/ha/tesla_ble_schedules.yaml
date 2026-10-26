@@ -70,7 +70,9 @@ template:
     actions:
       - variables:
           requests: >-
-            {%- set old = this.attributes.requests if this.attributes.requests is mapping else {} -%}
+            {#- `this` is not available in actions: read the previous value from the state machine -#}
+            {%- set old = state_attr('sensor.tesla_charge_requests', 'requests') -%}
+            {%- set old = old if old is mapping else {} -%}
             {%- set ns = namespace(d={}) -%}
             {%- if trigger.platform == 'event' -%}
               {%- set sid = trigger.event.data.schedule_id | string -%}
