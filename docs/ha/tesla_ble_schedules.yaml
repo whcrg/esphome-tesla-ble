@@ -4,9 +4,13 @@
 # What you get:
 #   - sensor.tesla_charge_schedules / sensor.tesla_precondition_schedules (state = count, attributes
 #     `schedules` = the list read from the car, `read_at` = when it was read)
+#   - sensor.tesla_next_departure: the next departure at Home, plus `all_upcoming` (next 72 h) with each
+#     departure's charge request. Meant for external charging planners (no bitmask/one-time parsing needed)
 #   - scripts to wake the car, refresh the lists, add/edit/delete schedules and precondition now
 #   - an automation that re-reads the lists whenever the car is awake and the last read is over an hour old
-#   - a schedule editor (helpers + 2 automations) used by docs/ha/tesla_ble_dashboard.yaml
+#   - "also charge for this departure" on precondition schedules, handled either by a linked car charge
+#     schedule or by an external planner (input_select.tesla_charge_scheduling)
+#   - a schedule editor (helpers + automations) used by docs/ha/tesla_ble_dashboard.yaml
 #
 # Install:
 #   1. configuration.yaml:   homeassistant:
@@ -20,6 +24,14 @@
 #   6. Setting schedules needs `allow_setting_schedules: 1` under `tesla_ble_vehicle:` in the ESPHome yaml.
 #
 # Days are a bitmask: Sun = 1, Mon = 2, Tue = 4, Wed = 8, Thu = 16, Fri = 32, Sat = 64.
+#
+# Charging for a departure: a precondition schedule whose name contains `ch:HHMM-HHMM` (for example
+# `ch:0100-0700`, or `HA shift | ch:0100-0700`) asks for charging in that window. With
+# "Car charge schedules" the reconcile automation keeps a car charge schedule named `pc:<precondition id>`
+# in step with it. With "External planner" no car charge schedules are kept (they conflict with external
+# smart charging) and the request is only published in sensor.tesla_next_departure and the
+# `tesla_ble_departure_changed` event. Storing the tag needs a TeslaBLE library that supports precondition
+# schedule names (PedroKTFC/tesla-ble#21).
 # =====================================================================================================
 
 template:
@@ -46,8 +58,86 @@ template:
           schedules: "{{ (trigger.event.data.schedules | from_json).precondition_schedules }}"
           read_at: "{{ now().isoformat() }}"   # when the car's list arrived; kept across HA restarts
 
-# ----------------------------------------------------------------------------- schedule editor helpers
+  # Next departures resolved from the precondition schedules (one-time schedules by their creation time).
+  - triggers:
+      - trigger: state
+        entity_id: sensor.tesla_precondition_schedules
+      - trigger: state
+        entity_id: input_select.tesla_charge_scheduling
+      - trigger: time_pattern
+        minutes: "/5"
+      - trigger: homeassistant
+        event: start
+    actions:
+      - variables:
+          upcoming: >-
+            {%- set pre = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
+            {%- set pre = pre if pre is list else [] -%}
+            {%- set n = now() -%}
+            {%- set horizon = n + timedelta(hours=72) -%}
+            {%- set out = namespace(l=[]) -%}
+            {%- for s in pre if s.enabled -%}
+              {%- set hh = (s.precondition_time // 60) % 24 -%}{%- set mm = s.precondition_time % 60 -%}
+              {%- set runs = namespace(l=[]) -%}
+              {%- if s.one_time -%}
+                {%- set created = as_local(as_datetime(s.id)) if s.id >= 1600000000 else n -%}
+                {%- set r = created.replace(hour=hh, minute=mm, second=0, microsecond=0) -%}
+                {%- set r = r + timedelta(days=1) if r <= created else r -%}
+                {%- set runs.l = [r] -%}
+              {%- else -%}
+                {%- for d in range(0, 4) -%}
+                  {%- set r = n.replace(hour=hh, minute=mm, second=0, microsecond=0) + timedelta(days=d) -%}
+                  {%- if (s.days // (2 ** ((r.weekday() + 1) % 7))) % 2 == 1 -%}{%- set runs.l = runs.l + [r] -%}{%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+              {%- set tag = (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})') -%}
+              {%- set z = namespace(best='', d=99999) -%}
+              {%- for zone in states.zone if zone.attributes.latitude is defined -%}
+                {%- set dz = distance(s.latitude, s.longitude, zone.entity_id) -%}
+                {%- if dz is number and dz <= [zone.attributes.radius | default(100) / 1000, 0.5] | max and dz < z.d -%}
+                  {%- set z.best = zone.entity_id -%}{%- set z.d = dz -%}{%- endif -%}
+              {%- endfor -%}
+              {%- for r in runs.l if n < r <= horizon -%}
+                {%- if tag -%}
+                  {%- set e = r.replace(hour=tag[0][2] | int, minute=tag[0][3] | int) -%}
+                  {%- set e = e - timedelta(days=1) if e > r else e -%}
+                  {%- set st = e.replace(hour=tag[0][0] | int, minute=tag[0][1] | int) -%}
+                  {%- set st = st - timedelta(days=1) if st > e else st -%}
+                {%- endif -%}
+                {%- set out.l = out.l + [{
+                      'at': r.isoformat(),
+                      'schedule_id': s.id,
+                      'name': (s.name | default('')).split('ch:')[0] | regex_replace('\\s*\\|\\s*$', '') | trim,
+                      'one_time': s.one_time,
+                      'location': z.best if z.best else 'other',
+                      'latitude': s.latitude, 'longitude': s.longitude,
+                      'charge': tag | count > 0,
+                      'charge_start': st.isoformat() if tag else none,
+                      'charge_end': e.isoformat() if tag else none}] -%}
+              {%- endfor -%}
+            {%- endfor -%}
+            {{- out.l | sort(attribute='at') -}}
+    sensor:
+      - name: Tesla next departure
+        unique_id: tesla_next_departure
+        icon: mdi:car-clock
+        device_class: timestamp
+        # Next enabled departure within the Home zone in the next 72 h, or unknown
+        state: "{{ (upcoming | selectattr('location', 'eq', 'zone.home') | map(attribute='at') | first) | default(none) }}"
+        attributes:
+          all_upcoming: "{{ upcoming }}"
+          charge_scheduling: "{{ states('input_select.tesla_charge_scheduling') }}"
+
+# ----------------------------------------------------------------------------- settings and editor helpers
 input_select:
+  tesla_charge_scheduling:
+    name: Tesla charge scheduling
+    icon: mdi:ev-plug-type2
+    # "Car charge schedules": "also charge" on a precondition schedule keeps a linked car charge schedule.
+    # "External planner": no car charge schedules are kept; charge requests go to sensor.tesla_next_departure.
+    options:
+      - Car charge schedules
+      - External planner
   tesla_schedule_select:
     name: Tesla schedule
     icon: mdi:calendar-search
@@ -75,15 +165,20 @@ input_datetime:
     has_time: true
     icon: mdi:clock-start
   tesla_schedule_end:
-    name: Tesla schedule end    # charge end
+    name: Tesla schedule end    # charge end (also the end of a precondition schedule's charge window)
     has_time: true
     icon: mdi:clock-end
+  tesla_schedule_charge_start:
+    name: Tesla schedule charge from   # start of a precondition schedule's charge window
+    has_time: true
+    icon: mdi:clock-start
 
 input_boolean:
   tesla_schedule_start_enabled: { name: Tesla schedule use start, icon: mdi:clock-start }
   tesla_schedule_end_enabled: { name: Tesla schedule use end, icon: mdi:clock-end }
   tesla_schedule_one_time: { name: Tesla schedule one time, icon: mdi:numeric-1-circle }
   tesla_schedule_enabled: { name: Tesla schedule enabled, icon: mdi:check-circle }
+  tesla_schedule_also_charge: { name: Tesla schedule also charge, icon: mdi:ev-station }
   tesla_schedule_day_mon: { name: Mon, icon: mdi:calendar-week }
   tesla_schedule_day_tue: { name: Tue, icon: mdi:calendar-week }
   tesla_schedule_day_wed: { name: Wed, icon: mdi:calendar-week }
@@ -161,12 +256,17 @@ script:
     description: >-
       Adds a preconditioning (departure) schedule, or edits the one with the given ID. The car only runs a
       schedule when it is parked near its location: pick a zone, or give latitude/longitude (these win).
+      A name containing `ch:HHMM-HHMM` also asks for charging in that window (see the top of this file).
     icon: mdi:car-clock
     mode: queued
     fields: &schedule_common_fields
       schedule_id:
         name: Schedule ID
         description: Empty adds a new schedule, an existing ID edits it
+        selector: { text: }
+      name:
+        name: Name
+        description: Optional. `ch:HHMM-HHMM` in a precondition schedule's name requests charging in that window
         selector: { text: }
       time:
         name: Ready at
@@ -213,7 +313,7 @@ script:
       - action: esphome.tesla_ble_set_precondition_schedule
         data:
           schedule_id: "{{ schedule_id | default('') }}"
-          name: ""
+          name: "{{ name | default('') }}"
           days_of_week: "{{ bits }}"
           precondition_time: "{{ (time.split(':')[0] | int) * 60 + (time.split(':')[1] | int) }}"
           one_time: "{{ one_time | default(true) }}"
@@ -223,7 +323,9 @@ script:
 
   tesla_set_charge_schedule:
     alias: Tesla - add or edit charge schedule
-    description: Adds a charging schedule, or edits the one with the given ID.
+    description: >-
+      Adds a charging schedule, or edits the one with the given ID. Charge schedules named `pc:<id>` are
+      managed by the linked-charging automation; edit their precondition schedule instead.
     icon: mdi:ev-station
     mode: queued
     fields:
@@ -262,7 +364,7 @@ script:
       - action: esphome.tesla_ble_edit_charge_schedule
         data:
           schedule_id: "{{ schedule_id | default('') }}"
-          name: ""
+          name: "{{ name | default('') }}"
           days_of_week: "{{ bits }}"
           start_enabled: "{{ start_enabled | default(true) }}"
           start_time: "{{ (time.split(':')[0] | int) * 60 + (time.split(':')[1] | int) }}"
@@ -275,7 +377,9 @@ script:
 
   tesla_delete_schedule:
     alias: Tesla - delete schedule
-    description: Deletes one charge or precondition schedule by ID. The list is re-read automatically.
+    description: >-
+      Deletes one charge or precondition schedule by ID. The list is re-read automatically, and a linked
+      charge schedule of a deleted precondition schedule is removed by the linked-charging automation.
     icon: mdi:delete-clock
     mode: queued
     fields:
@@ -308,13 +412,15 @@ script:
     alias: Tesla schedule editor - save
     description: >-
       Saves the schedule in the editor to the car: edits the selected one, or adds a new one. The location
-      is the zone picked in the editor, or the schedule's own location when "📍 Keep: …" is picked.
+      is the zone picked in the editor, or the schedule's own location when "📍 Keep: …" is picked. For a
+      precondition schedule, "also charge" is stored in its name as `ch:HHMM-HHMM`.
     icon: mdi:content-save
     mode: single
     sequence:
       - variables:
           sel: "{{ states('input_select.tesla_schedule_select') }}"
           sid: "{{ sel.split('#')[-1] if '#' in sel else '' }}"
+          kind: "{{ states('input_select.tesla_schedule_type') }}"
           days: >-
             {%- set ns = namespace(l=[]) -%}
             {%- for d in ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'] -%}
@@ -329,8 +435,24 @@ script:
           loc_sel: "{{ states('input_select.tesla_schedule_location') }}"
           loc_zone: >-
             {{- states.zone | selectattr('name', 'eq', loc_sel) | map(attribute='entity_id') | first | default('') -}}
+      - variables:
+          # New precondition schedules get their ID here (the creation time, like the car's own IDs), so the
+          # departure event can name it.
+          schedule_id: >-
+            {{- sid if sid != '' or kind == 'charge' else (as_timestamp(now()) | int) | string -}}
+          also_charge: "{{ kind == 'precondition' and is_state('input_boolean.tesla_schedule_also_charge', 'on') }}"
+          charge_start: "{{ states('input_datetime.tesla_schedule_charge_start')[:5] }}"
+          charge_end: "{{ states('input_datetime.tesla_schedule_end')[:5] }}"
+          base_name: >-
+            {{- ((existing.name | default('')).split('ch:')[0] | regex_replace('\\s*\\|\\s*$', '') | trim)
+                if kind == 'precondition' else existing.name | default('') -}}
+      - variables:
+          name: >-
+            {{- base_name ~ (' | ' if base_name and also_charge else '')
+                ~ (('ch:' ~ charge_start | replace(':', '') ~ '-' ~ charge_end | replace(':', '')) if also_charge else '') -}}
           common:
-            schedule_id: "{{ sid }}"
+            schedule_id: "{{ schedule_id }}"
+            name: "{{ name }}"
             time: "{{ states('input_datetime.tesla_schedule_time') }}"
             days: "{{ days }}"
             one_time: "{{ is_state('input_boolean.tesla_schedule_one_time', 'on') }}"
@@ -351,6 +473,14 @@ script:
             entity_id: input_select.tesla_schedule_type
             state: charge
         then:
+          - if:
+              - condition: state
+                entity_id: input_select.tesla_charge_scheduling
+                state: External planner
+            then:
+              - stop: >-
+                  Charge scheduling is set to External planner: car charge schedules would conflict with it
+                error: true
           - action: script.tesla_set_charge_schedule
             data: >-
               {{- dict(common,
@@ -360,15 +490,31 @@ script:
         else:
           - action: script.tesla_set_precondition_schedule
             data: "{{ common }}"
+          - event: tesla_ble_departure_changed
+            event_data:
+              change: saved
+              schedule_id: "{{ schedule_id }}"
+              ready_time: "{{ common.time }}"
+              days: "{{ days }}"
+              one_time: "{{ common.one_time }}"
+              enabled: "{{ common.enabled }}"
+              charge: "{{ also_charge }}"
+              charge_start: "{{ charge_start if also_charge else none }}"
+              charge_end: "{{ charge_end if also_charge else none }}"
+              latitude: "{{ common.latitude }}"
+              longitude: "{{ common.longitude }}"
 
   tesla_schedule_editor_delete:
     alias: Tesla schedule editor - delete selected
-    description: Deletes the schedule selected in the editor (only that one).
+    description: >-
+      Deletes the schedule selected in the editor (only that one). A linked charge schedule of a precondition
+      schedule is removed with it by the linked-charging automation.
     icon: mdi:delete
     mode: single
     sequence:
       - variables:
           sel: "{{ states('input_select.tesla_schedule_select') }}"
+          kind: "{{ states('input_select.tesla_schedule_type') }}"
       - if:
           - "{{ '#' not in sel }}"
         then:
@@ -376,8 +522,17 @@ script:
             error: true
       - action: script.tesla_delete_schedule
         data:
-          kind: "{{ states('input_select.tesla_schedule_type') }}"
+          kind: "{{ kind }}"
           schedule_id: "{{ sel.split('#')[-1] }}"
+      - if:
+          - condition: state
+            entity_id: input_select.tesla_schedule_type
+            state: precondition
+        then:
+          - event: tesla_ble_departure_changed
+            event_data:
+              change: deleted
+              schedule_id: "{{ sel.split('#')[-1] }}"
 
 # ----------------------------------------------------------------------------------- automations
 automation:
@@ -412,9 +567,100 @@ automation:
       - action: esphome.tesla_ble_get_charge_schedules
       - action: esphome.tesla_ble_get_precondition_schedules
 
+  - id: tesla_linked_charging_reconcile
+    alias: Tesla schedules - keep linked charge schedules in step
+    description: >-
+      With "Car charge schedules": for every precondition schedule whose name has `ch:HHMM-HHMM`, keeps a car
+      charge schedule named `pc:<precondition id>` with the same days, one-time, enabled and location,
+      charging in that window; removes linked charge schedules whose precondition schedule is gone or no
+      longer asks for charging. With "External planner": removes all linked charge schedules.
+      Other charge schedules are never touched.
+    mode: queued
+    max: 3
+    triggers:
+      - trigger: state
+        entity_id:
+          - sensor.tesla_precondition_schedules
+          - sensor.tesla_charge_schedules
+        for: { seconds: 5 }   # both lists are usually re-read together after a change
+      - trigger: state
+        entity_id: input_select.tesla_charge_scheduling
+    conditions:
+      - "{{ state_attr('sensor.tesla_precondition_schedules', 'schedules') is list
+            and state_attr('sensor.tesla_charge_schedules', 'schedules') is list }}"
+    actions:
+      - variables:
+          car_mode: "{{ is_state('input_select.tesla_charge_scheduling', 'Car charge schedules') }}"
+          pre: "{{ state_attr('sensor.tesla_precondition_schedules', 'schedules') }}"
+          ch: "{{ state_attr('sensor.tesla_charge_schedules', 'schedules') }}"
+          linked: "{{ ch | selectattr('name', 'match', 'pc:\\d+$') | list }}"
+          desired: >-
+            {%- set out = namespace(l=[]) -%}
+            {%- if car_mode -%}
+            {%- for s in pre -%}
+              {%- set tag = (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})') -%}
+              {%- if tag -%}
+                {%- set cur = linked | selectattr('name', 'eq', 'pc:' ~ s.id) | list -%}
+                {%- set out.l = out.l + [{
+                      'schedule_id': (cur[0].id if cur else s.id + 1) | string,
+                      'name': 'pc:' ~ s.id,
+                      'start_time': (tag[0][0] | int) * 60 + (tag[0][1] | int),
+                      'end_time': (tag[0][2] | int) * 60 + (tag[0][3] | int),
+                      'days': s.days, 'one_time': s.one_time, 'enabled': s.enabled,
+                      'latitude': s.latitude, 'longitude': s.longitude,
+                      'current': cur[0] if cur else none}] -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- endif -%}
+            {{- out.l -}}
+      - variables:
+          # A linked schedule needs writing when it is missing or any field differs
+          to_set: >-
+            {%- set out = namespace(l=[]) -%}
+            {%- for d in desired -%}
+              {%- set c = d.current -%}
+              {%- if c is none or c.start_time != d.start_time or c.end_time != d.end_time or c.days != d.days
+                    or c.one_time != d.one_time or c.enabled != d.enabled or not c.start_enabled or not c.end_enabled
+                    or (c.latitude - d.latitude) | abs > 0.0001 or (c.longitude - d.longitude) | abs > 0.0001 -%}
+                {%- set out.l = out.l + [d] -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{- out.l -}}
+          to_delete: >-
+            {{- linked | rejectattr('name', 'in', desired | map(attribute='name') | list) | map(attribute='id') | list -}}
+      - if:
+          - "{{ to_set | count + to_delete | count == 0 }}"
+        then:
+          - stop: Linked charge schedules already in step
+      - action: script.tesla_ensure_awake
+      - repeat:
+          for_each: "{{ to_delete }}"
+          sequence:
+            - action: esphome.tesla_ble_delete_charge_schedule
+              data: { schedule_id: "{{ repeat.item | string }}" }
+      - repeat:
+          for_each: "{{ to_set }}"
+          sequence:
+            - action: esphome.tesla_ble_edit_charge_schedule
+              data:
+                schedule_id: "{{ repeat.item.schedule_id }}"
+                name: "{{ repeat.item.name }}"
+                days_of_week: "{{ repeat.item.days }}"
+                start_enabled: true
+                start_time: "{{ repeat.item.start_time }}"
+                end_enabled: true
+                end_time: "{{ repeat.item.end_time }}"
+                one_time: "{{ repeat.item.one_time }}"
+                enabled: "{{ repeat.item.enabled }}"
+                latitude: "{{ repeat.item.latitude }}"
+                longitude: "{{ repeat.item.longitude }}"
+
   - id: tesla_schedule_editor_sync_list
     alias: Tesla schedule editor - sync list
-    description: Rebuilds the editor's schedule list when the car's schedules change, keeping the selection.
+    description: >-
+      Rebuilds the editor's schedule list when the car's schedules change, keeping the selection. Linked
+      charge schedules are left out (edit their precondition schedule), and "New charge schedule" is left
+      out while an external planner handles charging.
     mode: queued
     max_exceeded: silent
     triggers:
@@ -422,12 +668,15 @@ automation:
         entity_id:
           - sensor.tesla_precondition_schedules
           - sensor.tesla_charge_schedules
+      - trigger: state
+        entity_id: input_select.tesla_charge_scheduling
       - trigger: homeassistant
         event: start
     actions:
       - variables:
           sel: "{{ states('input_select.tesla_schedule_select') }}"
           current_id: "{{ sel.split('#')[-1] if '#' in sel else '' }}"
+          car_mode: "{{ is_state('input_select.tesla_charge_scheduling', 'Car charge schedules') }}"
           pre: >-
             {%- set p = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}{{ p if p is list else [] -}}
           ch: >-
@@ -443,12 +692,16 @@ automation:
             {%- if z.best == state_attr('zone.home', 'friendly_name') -%}{%- elif z.best -%}{{ ' · ' ~ z.best }}
             {%- else -%}{{ ' · Other, ' ~ ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from Home' }}{%- endif -%}
             {%- endmacro -%}
-            {%- set ns = namespace(o=['➕ New precondition schedule', '➕ New charge schedule']) -%}
+            {%- macro charge(s) -%}
+            {%- set tag = (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})') -%}
+            {%- if tag -%}{{ ' · 🔌 ' ~ tag[0][0] ~ ':' ~ tag[0][1] ~ '–' ~ tag[0][2] ~ ':' ~ tag[0][3] }}{%- endif -%}
+            {%- endmacro -%}
+            {%- set ns = namespace(o=['➕ New precondition schedule'] + (['➕ New charge schedule'] if car_mode else [])) -%}
             {%- for s in pre | sort(attribute='precondition_time') -%}
             {%- set ns.o = ns.o + ['🌡️ ' ~ s['*precondition_time'] ~ ' · ' ~ s['*days'] ~ ' · '
-                 ~ ('Once' if s.one_time else 'Weekly') ~ ('' if s.enabled else ' · paused') ~ where(s) ~ ' · #' ~ s.id] -%}
+                 ~ ('Once' if s.one_time else 'Weekly') ~ ('' if s.enabled else ' · paused') ~ charge(s) ~ where(s) ~ ' · #' ~ s.id] -%}
             {%- endfor -%}
-            {%- for s in ch | sort(attribute='start_time') -%}
+            {%- for s in ch | rejectattr('name', 'match', 'pc:\\d+$') | sort(attribute='start_time') -%}
             {%- set ns.o = ns.o + ['🔌 ' ~ ((s['*start_time'] ~ '–' ~ s['*end_time']) if s.start_enabled and s.end_enabled
                  else ('from ' ~ s['*start_time']) if s.start_enabled else ('until ' ~ s['*end_time'])) ~ ' · ' ~ s['*days'] ~ ' · '
                  ~ ('Once' if s.one_time else 'Weekly') ~ ('' if s.enabled else ' · paused') ~ where(s) ~ ' · #' ~ s.id] -%}
@@ -490,14 +743,24 @@ automation:
           match_pre: "{{ pre | selectattr('id', 'eq', sid | int(0)) | list }}"
           match_ch: "{{ ch | selectattr('id', 'eq', sid | int(0)) | list }}"
           kind: "{{ 'charge' if (sel == '➕ New charge schedule' or match_ch | count > 0) else 'precondition' }}"
+      - variables:
           s: >-
             {%- if match_pre | count > 0 -%}{{ match_pre[0] -}}
             {%- elif match_ch | count > 0 -%}{{ match_ch[0] -}}
             {%- elif kind == 'charge' -%}{{ {'days': 127, 'start_time': 0, 'end_time': 360, 'start_enabled': true,
                                            'end_enabled': true, 'one_time': true, 'enabled': true} -}}
             {%- else -%}{{ {'days': 127, 'precondition_time': 420, 'one_time': true, 'enabled': true} }}{%- endif -%}
+      - variables:
           t1: "{{ (s.precondition_time if kind == 'precondition' else s.start_time) | int(0) }}"
-          t2: "{{ s.end_time | default(360) | int(0) }}"
+          tag: "{{ (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})') if kind == 'precondition' else [] }}"
+      - variables:
+          also_charge: "{{ tag | count > 0 }}"
+          # Charge window of a precondition schedule: from its tag, else 6 h before the ready time until it
+          t_charge_start: >-
+            {{- ((tag[0][0] | int) * 60 + (tag[0][1] | int)) if tag else ((t1 - 360) % 1440) -}}
+          t2: >-
+            {{- ((tag[0][2] | int) * 60 + (tag[0][3] | int)) if tag
+                else (t1 if kind == 'precondition' else s.end_time | default(360) | int(0)) -}}
           zone_names: >-
             {%- set zs = states.zone | selectattr('attributes.latitude', 'defined') | list -%}
             {{- (zs | selectattr('entity_id', 'eq', 'zone.home') | map(attribute='name') | list)
@@ -511,11 +774,13 @@ automation:
             {%- set z.best = zone.name -%}{%- set z.d = d -%}{%- endif -%}{%- endfor -%}
             {%- endif -%}
             {{- z.best -}}
+      - variables:
           loc_keep: >-
             {%- if s.latitude is defined and loc_zone == '' -%}
             {%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}
             📍 Keep: Other, {{ (dh | round(1)) if dh < 10 else (dh | round(0) | int) }} km from Home
             {%- endif -%}
+      - variables:
           loc_options: "{{ zone_names + ([loc_keep] if loc_keep else []) }}"
           loc_selected: "{{ loc_zone if loc_zone else (loc_keep if loc_keep else zone_names[0]) }}"
           on_list: >-
@@ -525,14 +790,17 @@ automation:
             {%- set ns.l = ns.l + ['input_boolean.tesla_schedule_day_' ~ names[i]] -%}{%- endif -%}{%- endfor -%}
             {%- for flag, on in [('one_time', s.one_time), ('enabled', s.enabled),
                                 ('start_enabled', s.start_enabled | default(true)),
-                                ('end_enabled', s.end_enabled | default(true))] -%}
+                                ('end_enabled', s.end_enabled | default(true)),
+                                ('also_charge', also_charge)] -%}
             {%- if on -%}{%- set ns.l = ns.l + ['input_boolean.tesla_schedule_' ~ flag] -%}{%- endif -%}{%- endfor -%}
             {{- ns.l -}}
+      - variables:
           off_list: >-
             {%- set all = ['sun','mon','tue','wed','thu','fri','sat']
                          | map('regex_replace', '^', 'input_boolean.tesla_schedule_day_') | list
                          + ['input_boolean.tesla_schedule_one_time', 'input_boolean.tesla_schedule_enabled',
-                            'input_boolean.tesla_schedule_start_enabled', 'input_boolean.tesla_schedule_end_enabled'] -%}
+                            'input_boolean.tesla_schedule_start_enabled', 'input_boolean.tesla_schedule_end_enabled',
+                            'input_boolean.tesla_schedule_also_charge'] -%}
             {{- all | reject('in', on_list) | list -}}
       - action: input_select.select_option
         target:
@@ -559,9 +827,52 @@ automation:
           entity_id: input_datetime.tesla_schedule_end
         data:
           time: "{{ '%02d:%02d:00' % ((t2 // 60) % 24, t2 % 60) }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.tesla_schedule_charge_start
+        data:
+          time: "{{ '%02d:%02d:00' % ((t_charge_start // 60) % 24, t_charge_start % 60) }}"
       - action: input_boolean.turn_on
         target:
           entity_id: "{{ on_list if on_list | count > 0 else 'none' }}"
       - action: input_boolean.turn_off
         target:
           entity_id: "{{ off_list if off_list | count > 0 else 'none' }}"
+
+  - id: tesla_schedule_editor_follow_ready_time
+    alias: Tesla schedule editor - move charge window with ready time
+    description: >-
+      When you change a precondition schedule's ready time in the editor, the charge window moves with it
+      (same length, ending at the new ready time) as long as it ended at the old ready time.
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: input_datetime.tesla_schedule_time
+        not_to: [unavailable, unknown]
+    conditions:
+      - condition: state
+        entity_id: input_select.tesla_schedule_type
+        state: precondition
+      - "{{ trigger.to_state.context.user_id is not none }}"   # only your own edits, not the load automation
+      - "{{ trigger.from_state is not none and states('input_datetime.tesla_schedule_end') == trigger.from_state.state }}"
+    actions:
+      - variables:
+          old_ready: "{{ (trigger.from_state.state.split(':')[0] | int) * 60 + (trigger.from_state.state.split(':')[1] | int) }}"
+          new_ready: "{{ (trigger.to_state.state.split(':')[0] | int) * 60 + (trigger.to_state.state.split(':')[1] | int) }}"
+          start: >-
+            {%- set t = states('input_datetime.tesla_schedule_charge_start').split(':') -%}
+            {{- (t[0] | int) * 60 + (t[1] | int) -}}
+      - variables:
+          length: "{{ (old_ready - start) % 1440 }}"
+      - variables:
+          new_start: "{{ (new_ready - length) % 1440 }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.tesla_schedule_end
+        data:
+          time: "{{ trigger.to_state.state }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.tesla_schedule_charge_start
+        data:
+          time: "{{ '%02d:%02d:00' % (new_start // 60, new_start % 60) }}"
