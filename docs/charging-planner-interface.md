@@ -8,7 +8,7 @@ Entity IDs assume the ESPHome device name `tesla-ble`. With another name, `tesla
 
 | | Owns | Never does |
 | --- | --- | --- |
-| **Schedule package** | The car's precondition schedules, the user's charge requests attached to them (window and target), and, only in *Car charge schedules* mode, car charge schedules and the car's charge limit | In *External planner* mode: create car charge schedules, or write the charge limit |
+| **Schedule package** | The car's precondition schedules, the user's charge requests attached to them (window and target), and, only in *Car charge schedules* mode, car charge schedules and the car's charge limit | In *External planner* mode: create car charge schedules at Home, or write the charge limit |
 | **Planner** | When and how fast to charge, the charger, and in *External planner* mode the car's charge limit and charging amps | Create car charge schedules (they conflict, see 5); edit the package's helpers |
 
 The mode is `input_select.tesla_charge_scheduling`: `Car charge schedules` or `External planner`. A planner should check it is `External planner` and otherwise stay passive, or warn.
@@ -32,7 +32,7 @@ A trigger-based template sensor. It updates when the car's precondition list cha
 | --- | --- | --- |
 | `at` | ISO datetime (local offset) | When the car should be ready (the precondition time) |
 | `schedule_id` | int | ID of the car's precondition schedule. It is the creation time as a Unix timestamp, but treat it as an opaque ID |
-| `name` | string | The schedule's name without the charge tag (for example `HA shift`); `""` if none |
+| `name` | string | The schedule's name; `""` if none (the car does not seem to keep names) |
 | `one_time` | bool | `true` if the schedule runs once |
 | `location` | string | Zone entity ID the schedule belongs to (for example `zone.home`), or `other` |
 | `latitude`, `longitude` | float | The schedule's location |
@@ -56,7 +56,7 @@ A trigger-based template sensor. It updates when the car's precondition list cha
 
 ## 4. Event: `tesla_ble_departure_changed`
 
-Fired by the package's schedule editor right after the user saves or deletes a precondition schedule, before the car's updated list has been read back. Use it to replan sooner; `sensor.tesla_next_departure` remains the source of truth and follows within seconds to a minute.
+Fired by `script.tesla_set_precondition_schedule` and `script.tesla_delete_schedule` (which the schedule editor uses) right after a precondition schedule is saved or deleted, before the car's updated list has been read back. Use it to replan sooner; `sensor.tesla_next_departure` remains the source of truth and follows within seconds to a minute.
 
 | Field | `change: saved` | `change: deleted` |
 | --- | --- | --- |
@@ -70,20 +70,18 @@ Fired by the package's schedule editor right after the user saves or deletes a p
 | `charge_target` | int or `null` | — |
 | `latitude`, `longitude` | float | — |
 
-Schedules changed outside the editor (Tesla app, the car's screen, other automations) do not fire this event; they show up in the sensor after the next read.
+Schedules changed outside these scripts (Tesla app, the car's screen, direct ESPHome action calls) do not fire this event; they show up in the sensor after the next read.
 
 ## 5. Things the planner must keep in mind
 
-- **No car charge schedules in External planner mode.** Car-side charge schedules (and Tesla's scheduled or off-peak charging) can make the car refuse to start when the charger switches on, or start when the planner doesn't want it. The package removes its own linked ones and its card warns about any others, but it never deletes schedules it didn't create.
+- **No car charge schedules at Home in External planner mode.** Car-side charge schedules (and Tesla's scheduled or off-peak charging) can make the car refuse to start when the charger switches on, or start when the planner doesn't want it. The package removes its own linked ones, refuses new ones at Home and its card warns about any others at Home, but it never deletes schedules it didn't create. Charge schedules at other locations (for example at work) don't interfere: the car only uses a schedule where it was made.
 - **Charge limit and amps** are the planner's to write in this mode (`number.tesla_ble_charging_limit`, `number.tesla_ble_charging_amps`). The package doesn't touch them.
 - **Waking the car:** call `script.tesla_ensure_awake` before writing to the car. It wakes it if needed, waits up to 60 s and fails if the car doesn't wake, so later steps don't run against a sleeping car. Writing only when the value differs avoids needless wake-ups.
 - **Departure location:** the car only runs a schedule when parked at its location, so departures with `location != 'zone.home'` usually matter only when the car is there.
 
 ## 6. How the request is stored (for reference)
 
-The request lives in the car, inside the precondition schedule's name: `ch:HHMM-HHMM` with an optional `@NN` target, after any existing name and ` | ` (for example `HA shift | ch:0100-0700@80`). A planner should read `sensor.tesla_next_departure` rather than parse names. An exact comparison such as `name == "HA shift"` on the raw schedule list breaks once a charge request is added; the sensor's `name` field has the tag removed.
-
-Storing the name needs a TeslaBLE library with precondition schedule name support (PedroKTFC/tesla-ble#21). Without it, schedules work but cannot carry a charge request.
+The car has no field for a charge request (and does not keep precondition schedule names), so requests live in Home Assistant: `sensor.tesla_charge_requests`, attribute `requests`, a mapping from precondition schedule ID (as a string) to `{start: "HH:MM", end: "HH:MM", target: int or null, seen: ISO datetime}`. It is updated from `tesla_ble_departure_changed` and kept across restarts; a request whose schedule has been missing from the car's list for 7 days is dropped. A planner should read `sensor.tesla_next_departure`, which resolves these into dates, rather than this sensor.
 
 ## 7. Car charge schedules mode (for completeness)
 
