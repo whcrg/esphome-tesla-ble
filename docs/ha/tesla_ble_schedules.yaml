@@ -25,10 +25,11 @@
 #
 # Days are a bitmask: Sun = 1, Mon = 2, Tue = 4, Wed = 8, Thu = 16, Fri = 32, Sat = 64.
 #
-# Charging for a departure: a precondition schedule whose name contains `ch:HHMM-HHMM` (for example
-# `ch:0100-0700`, or `HA shift | ch:0100-0700`) asks for charging in that window. With
+# Charging for a departure: a precondition schedule whose name contains `ch:HHMM-HHMM` or `ch:HHMM-HHMM@NN`
+# (for example `ch:0100-0700@80`, or `HA shift | ch:0100-0700@80`) asks for charging in that window, to NN %. With
 # "Car charge schedules" the reconcile automation keeps a car charge schedule named `pc:<precondition id>`
-# in step with it. With "External planner" no car charge schedules are kept (they conflict with external
+# in step with it, and the car's charge limit is set to NN % when the window starts. With "External planner"
+# no car charge schedules are kept and the charge limit is left alone (both conflict with external
 # smart charging) and the request is only published in sensor.tesla_next_departure and the
 # `tesla_ble_departure_changed` event. Storing the tag needs a TeslaBLE library that supports precondition
 # schedule names (PedroKTFC/tesla-ble#21).
@@ -90,7 +91,7 @@ template:
                   {%- if (s.days // (2 ** ((r.weekday() + 1) % 7))) % 2 == 1 -%}{%- set runs.l = runs.l + [r] -%}{%- endif -%}
                 {%- endfor -%}
               {%- endif -%}
-              {%- set tag = (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})') -%}
+              {%- set tag = (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})(?:@(\\d{2,3}))?') -%}
               {%- set z = namespace(best='', d=99999) -%}
               {%- for zone in states.zone if zone.attributes.latitude is defined -%}
                 {%- set dz = distance(s.latitude, s.longitude, zone.entity_id) -%}
@@ -113,7 +114,8 @@ template:
                       'latitude': s.latitude, 'longitude': s.longitude,
                       'charge': tag | count > 0,
                       'charge_start': st.isoformat() if tag else none,
-                      'charge_end': e.isoformat() if tag else none}] -%}
+                      'charge_end': e.isoformat() if tag else none,
+                      'charge_target': (tag[0][4] | int) if tag and tag[0][4] else none}] -%}
               {%- endfor -%}
             {%- endfor -%}
             {{- out.l | sort(attribute='at') -}}
@@ -186,6 +188,15 @@ input_boolean:
   tesla_schedule_day_fri: { name: Fri, icon: mdi:calendar-week }
   tesla_schedule_day_sat: { name: Sat, icon: mdi:calendar-weekend }
   tesla_schedule_day_sun: { name: Sun, icon: mdi:calendar-weekend }
+
+input_number:
+  tesla_schedule_charge_target:
+    name: Tesla schedule charge to   # charge target of a precondition schedule's charge request
+    min: 50
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-charging-80
 
 # ------------------------------------------------------------------------------------------- scripts
 script:
@@ -443,13 +454,15 @@ script:
           also_charge: "{{ kind == 'precondition' and is_state('input_boolean.tesla_schedule_also_charge', 'on') }}"
           charge_start: "{{ states('input_datetime.tesla_schedule_charge_start')[:5] }}"
           charge_end: "{{ states('input_datetime.tesla_schedule_end')[:5] }}"
+          charge_target: "{{ states('input_number.tesla_schedule_charge_target') | float(0) | int }}"
           base_name: >-
             {{- ((existing.name | default('')).split('ch:')[0] | regex_replace('\\s*\\|\\s*$', '') | trim)
                 if kind == 'precondition' else existing.name | default('') -}}
       - variables:
           name: >-
             {{- base_name ~ (' | ' if base_name and also_charge else '')
-                ~ (('ch:' ~ charge_start | replace(':', '') ~ '-' ~ charge_end | replace(':', '')) if also_charge else '') -}}
+                ~ (('ch:' ~ charge_start | replace(':', '') ~ '-' ~ charge_end | replace(':', '')
+                    ~ (('@' ~ charge_target) if charge_target else '')) if also_charge else '') -}}
           common:
             schedule_id: "{{ schedule_id }}"
             name: "{{ name }}"
@@ -501,6 +514,7 @@ script:
               charge: "{{ also_charge }}"
               charge_start: "{{ charge_start if also_charge else none }}"
               charge_end: "{{ charge_end if also_charge else none }}"
+              charge_target: "{{ charge_target if also_charge and charge_target else none }}"
               latitude: "{{ common.latitude }}"
               longitude: "{{ common.longitude }}"
 
@@ -598,7 +612,7 @@ automation:
             {%- set out = namespace(l=[]) -%}
             {%- if car_mode -%}
             {%- for s in pre -%}
-              {%- set tag = (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})') -%}
+              {%- set tag = (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})(?:@(\\d{2,3}))?') -%}
               {%- if tag -%}
                 {%- set cur = linked | selectattr('name', 'eq', 'pc:' ~ s.id) | list -%}
                 {%- set out.l = out.l + [{
@@ -655,6 +669,49 @@ automation:
                 latitude: "{{ repeat.item.latitude }}"
                 longitude: "{{ repeat.item.longitude }}"
 
+  - id: tesla_linked_charging_apply_target
+    alias: Tesla schedules - set charge limit when a charge window starts
+    description: >-
+      With "Car charge schedules": when a departure's charge window starts, sets the car's charge limit to
+      that departure's target (`@NN` in its `ch:` tag), so the linked charge schedule charges to it. Car charge
+      schedules cannot hold a limit themselves. Does nothing with "External planner".
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: template
+        value_template: >-
+          {%- set ns = namespace(on=false) -%}
+          {%- for d in (state_attr('sensor.tesla_next_departure', 'all_upcoming') or []) if d.charge and d.charge_target -%}
+            {%- if (d.charge_start | as_datetime) <= now() < (d.charge_end | as_datetime) -%}{%- set ns.on = true -%}{%- endif -%}
+          {%- endfor -%}
+          {{- ns.on -}}
+    conditions:
+      - condition: state
+        entity_id: input_select.tesla_charge_scheduling
+        state: Car charge schedules
+      - condition: state
+        entity_id: binary_sensor.tesla_ble_ble_status
+        state: "on"
+    actions:
+      - variables:
+          target: >-
+            {%- set ns = namespace(t=none) -%}
+            {%- for d in (state_attr('sensor.tesla_next_departure', 'all_upcoming') or []) if d.charge and d.charge_target -%}
+              {%- if ns.t is none and (d.charge_start | as_datetime) <= now() < (d.charge_end | as_datetime) -%}
+                {%- set ns.t = d.charge_target -%}{%- endif -%}
+            {%- endfor -%}
+            {{- ns.t -}}
+      - if:
+          - "{{ target is none or (states('number.tesla_ble_charging_limit') | float(0) | int) == target }}"
+        then:
+          - stop: Charge limit already at the target
+      - action: script.tesla_ensure_awake
+      - action: number.set_value
+        target:
+          entity_id: number.tesla_ble_charging_limit
+        data:
+          value: "{{ target }}"
+
   - id: tesla_schedule_editor_sync_list
     alias: Tesla schedule editor - sync list
     description: >-
@@ -693,8 +750,9 @@ automation:
             {%- else -%}{{ ' · Other, ' ~ ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from Home' }}{%- endif -%}
             {%- endmacro -%}
             {%- macro charge(s) -%}
-            {%- set tag = (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})') -%}
-            {%- if tag -%}{{ ' · 🔌 ' ~ tag[0][0] ~ ':' ~ tag[0][1] ~ '–' ~ tag[0][2] ~ ':' ~ tag[0][3] }}{%- endif -%}
+            {%- set tag = (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})(?:@(\\d{2,3}))?') -%}
+            {%- if tag -%}{{ ' · 🔌 ' ~ tag[0][0] ~ ':' ~ tag[0][1] ~ '–' ~ tag[0][2] ~ ':' ~ tag[0][3]
+                             ~ ((' ' ~ tag[0][4] ~ '%') if tag[0][4] else '') }}{%- endif -%}
             {%- endmacro -%}
             {%- set ns = namespace(o=['➕ New precondition schedule'] + (['➕ New charge schedule'] if car_mode else [])) -%}
             {%- for s in pre | sort(attribute='precondition_time') -%}
@@ -752,12 +810,16 @@ automation:
             {%- else -%}{{ {'days': 127, 'precondition_time': 420, 'one_time': true, 'enabled': true} }}{%- endif -%}
       - variables:
           t1: "{{ (s.precondition_time if kind == 'precondition' else s.start_time) | int(0) }}"
-          tag: "{{ (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})') if kind == 'precondition' else [] }}"
+          tag: "{{ (s.name | default('')) | regex_findall('ch:(\\d{2})(\\d{2})-(\\d{2})(\\d{2})(?:@(\\d{2,3}))?') if kind == 'precondition' else [] }}"
       - variables:
           also_charge: "{{ tag | count > 0 }}"
           # Charge window of a precondition schedule: from its tag, else 6 h before the ready time until it
           t_charge_start: >-
             {{- ((tag[0][0] | int) * 60 + (tag[0][1] | int)) if tag else ((t1 - 360) % 1440) -}}
+          # Charge target: from the tag, else the car's current charge limit
+          charge_target: >-
+            {{- (tag[0][4] | int) if tag and tag[0][4]
+                else ([[states('number.tesla_ble_charging_limit') | float(80) | int, 50] | max, 100] | min) -}}
           t2: >-
             {{- ((tag[0][2] | int) * 60 + (tag[0][3] | int)) if tag
                 else (t1 if kind == 'precondition' else s.end_time | default(360) | int(0)) -}}
@@ -832,6 +894,11 @@ automation:
           entity_id: input_datetime.tesla_schedule_charge_start
         data:
           time: "{{ '%02d:%02d:00' % ((t_charge_start // 60) % 24, t_charge_start % 60) }}"
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.tesla_schedule_charge_target
+        data:
+          value: "{{ charge_target }}"
       - action: input_boolean.turn_on
         target:
           entity_id: "{{ on_list if on_list | count > 0 else 'none' }}"

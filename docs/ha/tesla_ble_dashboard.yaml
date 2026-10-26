@@ -18,13 +18,13 @@ cards:
   title: Schedules
   content: |-
     {%- macro loc(s) -%}{%- set z = namespace(best='', d=99999) -%}{%- for zone in states.zone if zone.attributes.latitude is defined -%}{%- set d = distance(s.latitude, s.longitude, zone.entity_id) -%}{%- if d is number and d <= [zone.attributes.radius | default(100) / 1000, 0.5] | max and d < z.d -%}{%- set z.best = zone.name -%}{%- set z.d = d -%}{%- endif -%}{%- endfor -%}{%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{{- z.best if z.best else 'Other, ' ~ ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from Home' -}}{%- endmacro -%}
-    {%- macro chg(s) -%}{%- set t = (s.name | default('')) | regex_findall('ch:(\d{2})(\d{2})-(\d{2})(\d{2})') -%}{{- (t[0][0] ~ ':' ~ t[0][1] ~ '–' ~ t[0][2] ~ ':' ~ t[0][3]) if t else '–' -}}{%- endmacro -%}
+    {%- macro chg(s) -%}{%- set t = (s.name | default('')) | regex_findall('ch:(\d{2})(\d{2})-(\d{2})(\d{2})(?:@(\d{2,3}))?') -%}{{- (t[0][0] ~ ':' ~ t[0][1] ~ '–' ~ t[0][2] ~ ':' ~ t[0][3] ~ ((' → ' ~ t[0][4] ~ '%') if t[0][4] else '')) if t else '–' -}}{%- endmacro -%}
     {%- set ch = state_attr('sensor.tesla_charge_schedules', 'schedules') -%}
     {%- set pre = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
     {%- set car_mode = is_state('input_select.tesla_charge_scheduling', 'Car charge schedules') -%}
     {%- set nd = states('sensor.tesla_next_departure') | as_datetime(none) -%}
     {%- set nxt = (state_attr('sensor.tesla_next_departure', 'all_upcoming') or []) | selectattr('location', 'eq', 'zone.home') | first | default(none) -%}
-    **Next departure:** {{ as_local(nd).strftime('%a %H:%M') if nd else 'none in the next 72 h' }}{{ (' · charge ' ~ as_local(nxt.charge_start | as_datetime).strftime('%H:%M') ~ '–' ~ as_local(nxt.charge_end | as_datetime).strftime('%H:%M') ~ (' (external planner)' if not car_mode else '')) if nxt and nxt.charge else '' }}
+    **Next departure:** {{ as_local(nd).strftime('%a %H:%M') if nd else 'none in the next 72 h' }}{{ (' · charge ' ~ as_local(nxt.charge_start | as_datetime).strftime('%H:%M') ~ '–' ~ as_local(nxt.charge_end | as_datetime).strftime('%H:%M') ~ ((' to ' ~ nxt.charge_target ~ '%') if nxt.charge_target else '') ~ (' (external planner)' if not car_mode else '')) if nxt and nxt.charge else '' }}
 
     ### 🌡️ Preconditioning
 
@@ -113,13 +113,13 @@ cards:
     - type: markdown
       content: |-
         {%- macro loc(s) -%}{%- set z = namespace(best='', d=99999) -%}{%- for zone in states.zone if zone.attributes.latitude is defined -%}{%- set d = distance(s.latitude, s.longitude, zone.entity_id) -%}{%- if d is number and d <= [zone.attributes.radius | default(100) / 1000, 0.5] | max and d < z.d -%}{%- set z.best = zone.name -%}{%- set z.d = d -%}{%- endif -%}{%- endfor -%}{%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{{- z.best if z.best else 'Other, ' ~ ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from Home' -}}{%- endmacro -%}
-        {%- macro chg(s) -%}{%- set t = (s.name | default('')) | regex_findall('ch:(\d{2})(\d{2})-(\d{2})(\d{2})') -%}{{- (t[0][0] ~ ':' ~ t[0][1] ~ '–' ~ t[0][2] ~ ':' ~ t[0][3]) if t else '–' -}}{%- endmacro -%}
+        {%- macro chg(s) -%}{%- set t = (s.name | default('')) | regex_findall('ch:(\d{2})(\d{2})-(\d{2})(\d{2})(?:@(\d{2,3}))?') -%}{{- (t[0][0] ~ ':' ~ t[0][1] ~ '–' ~ t[0][2] ~ ':' ~ t[0][3] ~ ((' → ' ~ t[0][4] ~ '%') if t[0][4] else '')) if t else '–' -}}{%- endmacro -%}
         {%- set ch = state_attr('sensor.tesla_charge_schedules', 'schedules') -%}
         {%- set pre = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
         {%- set car_mode = is_state('input_select.tesla_charge_scheduling', 'Car charge schedules') -%}
         {%- set nd = states('sensor.tesla_next_departure') | as_datetime(none) -%}
         {%- set nxt = (state_attr('sensor.tesla_next_departure', 'all_upcoming') or []) | selectattr('location', 'eq', 'zone.home') | first | default(none) -%}
-        **Next departure:** {{ as_local(nd).strftime('%a %H:%M') if nd else 'none in the next 72 h' }}{{ (' · charge ' ~ as_local(nxt.charge_start | as_datetime).strftime('%H:%M') ~ '–' ~ as_local(nxt.charge_end | as_datetime).strftime('%H:%M') ~ (' (external planner)' if not car_mode else '')) if nxt and nxt.charge else '' }}
+        **Next departure:** {{ as_local(nd).strftime('%a %H:%M') if nd else 'none in the next 72 h' }}{{ (' · charge ' ~ as_local(nxt.charge_start | as_datetime).strftime('%H:%M') ~ '–' ~ as_local(nxt.charge_end | as_datetime).strftime('%H:%M') ~ ((' to ' ~ nxt.charge_target ~ '%') if nxt.charge_target else '') ~ (' (external planner)' if not car_mode else '')) if nxt and nxt.charge else '' }}
 
         ### 🌡️ Preconditioning
 
@@ -204,6 +204,15 @@ cards:
         row:
           entity: input_datetime.tesla_schedule_end
           name: Charge until
+      - type: conditional
+        conditions:
+        - entity: input_select.tesla_schedule_type
+          state: precondition
+        - entity: input_boolean.tesla_schedule_also_charge
+          state: 'on'
+        row:
+          entity: input_number.tesla_schedule_charge_target
+          name: Charge to
       - type: conditional
         conditions:
         - entity: input_select.tesla_schedule_type
