@@ -102,6 +102,8 @@ What happens with the request depends on **Charge scheduling** (`input_select.te
 Storing the request needs a TeslaBLE library that supports precondition schedule names (PedroKTFC/tesla-ble#21).
 
 #### For external charging planners
+The full contract (fields, guarantees, what a planner must and mustn't do) is in [charging-planner-interface.md](./charging-planner-interface.md). In short:
+
 **`sensor.tesla_next_departure`** (device class timestamp) resolves the precondition schedules into concrete departures, so a planner doesn't need to understand day bitmasks, one-time rules or locations:
 
 - **state:** the next enabled departure in the Home zone within 72 hours, or unknown.
