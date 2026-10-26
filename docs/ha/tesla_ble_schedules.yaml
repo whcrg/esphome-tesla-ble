@@ -819,6 +819,9 @@ automation:
           - sensor.tesla_charge_requests
       - trigger: state
         entity_id: input_select.tesla_charge_scheduling
+      - trigger: state   # reloading input selects resets the options to the two "New" entries
+        entity_id: input_select.tesla_schedule_select
+        attribute: options
       - trigger: homeassistant
         event: start
     actions:
