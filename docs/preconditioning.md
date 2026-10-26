@@ -90,14 +90,14 @@ How it works: the *sync list* automation rebuilds the dropdown whenever a schedu
 > The car keeps a one-time schedule in its list after it has run. Delete old ones now and then: the list is limited to about ten schedules of each type (see above). `sensor.tesla_next_departure` (below) already ignores one-time schedules that have run.
 
 #### Charging for a departure
-A precondition schedule can also ask for charging before the departure. In the editor, turn on **Also charge for this departure** and set **Charge from** and **Charge until**. The default window is the 6 hours before the ready time, and it moves with the ready time when you change that. The request is stored in the schedule's own name as `ch:HHMM-HHMM` (any existing name is kept in front, for example `HA shift | ch:0100-0700`), so it lives in the car together with the schedule.
+A precondition schedule can also ask for charging before the departure. In the editor, turn on **Also charge for this departure** and set **Charge from**, **Charge until** and **Charge to** (the target %, which starts at the car's current charge limit). The default window is the 6 hours before the ready time, and it moves with the ready time when you change that. The request is stored in the schedule's own name as `ch:HHMM-HHMM@NN` (any existing name is kept in front, for example `HA shift | ch:0100-0700@80`), so it lives in the car together with the schedule.
 
 What happens with the request depends on **Charge scheduling** (`input_select.tesla_charge_scheduling`):
 
 | Setting | What happens |
 | --- | --- |
-| **Car charge schedules** | The *keep linked charge schedules in step* automation keeps a car charge schedule named `pc:<precondition id>` with the same days, one-time, enabled and location, charging in the window. Editing or deleting the precondition schedule updates or removes it. Linked charge schedules are marked 🔗 on the card and are left out of the editor's dropdown. |
-| **External planner** | No car charge schedules are kept: linked ones are removed, the editor won't create new ones, and the card warns if the car still has others. Car charge schedules (and scheduled or off-peak charging) can make the car refuse to start, or start, against an external planner. The request is published for the planner instead (below). |
+| **Car charge schedules** | The *keep linked charge schedules in step* automation keeps a car charge schedule named `pc:<precondition id>` with the same days, one-time, enabled and location, charging in the window. Editing or deleting the precondition schedule updates or removes it. A car charge schedule can't hold a charge limit, so when the window starts the *set charge limit* automation sets the car's limit to the target. Linked charge schedules are marked 🔗 on the card and are left out of the editor's dropdown. |
+| **External planner** | No car charge schedules are kept: linked ones are removed, the editor won't create new ones, and the card warns if the car still has others. The charge limit is left to the planner. Car charge schedules (and scheduled or off-peak charging) can make the car refuse to start, or start, against an external planner. The request is published for the planner instead (below). |
 
 Storing the request needs a TeslaBLE library that supports precondition schedule names (PedroKTFC/tesla-ble#21).
 
@@ -105,9 +105,9 @@ Storing the request needs a TeslaBLE library that supports precondition schedule
 **`sensor.tesla_next_departure`** (device class timestamp) resolves the precondition schedules into concrete departures, so a planner doesn't need to understand day bitmasks, one-time rules or locations:
 
 - **state:** the next enabled departure in the Home zone within 72 hours, or unknown.
-- **`all_upcoming`:** every enabled departure in the next 72 hours, sorted, each with `at`, `schedule_id`, `name` (without the tag), `one_time`, `location` (a zone entity ID or `other`), `latitude`, `longitude`, `charge` (true/false), and `charge_start` / `charge_end` (ISO times) when charging was asked for.
+- **`all_upcoming`:** every enabled departure in the next 72 hours, sorted, each with `at`, `schedule_id`, `name` (without the tag), `one_time`, `location` (a zone entity ID or `other`), `latitude`, `longitude`, `charge` (true/false), and `charge_start` / `charge_end` (ISO times) and `charge_target` (%) when charging was asked for.
 - **`charge_scheduling`:** the current setting.
 
 One-time schedules count only for their single run: the first ready time after they were created (their ID is the creation time). The sensor updates when the schedule list changes and every 5 minutes.
 
-The editor also fires **`tesla_ble_departure_changed`** after a precondition schedule is saved (`change: saved`, with its times, days, one-time, enabled, location and charge window) or deleted (`change: deleted`). A planner is free to use only the departure time and ignore the charge window.
+The editor also fires **`tesla_ble_departure_changed`** after a precondition schedule is saved (`change: saved`, with its times, days, one-time, enabled, location and charge window) or deleted (`change: deleted`). A planner is free to use only the departure time and ignore or override the charge window and target.
