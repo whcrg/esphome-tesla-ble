@@ -21,6 +21,9 @@ cards:
     {%- macro chg(s, reqs, car_mode) -%}{%- set r = reqs.get(s.id | string) -%}{{- (r.start ~ '–' ~ r.end ~ ((' → ' ~ r.target ~ '%') if r.target else '') ~ (' · car' if car_mode else ' · planner')) if r else '–' -}}{%- endmacro -%}
     {%- set ch = state_attr('sensor.tesla_charge_schedules', 'schedules') -%}
     {%- set pre = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
+    {%- set q = state_attr('sensor.tesla_schedule_queue', 'pending') or [] -%}
+    {%- set mp = state_attr('sensor.tesla_schedule_queue', 'precondition_schedules') -%}{%- set pre = mp if mp is list and (pre is list or q) else pre -%}
+    {%- set mc = state_attr('sensor.tesla_schedule_queue', 'charge_schedules') -%}{%- set ch = mc if mc is list and (ch is list or q) else ch -%}
     {%- set car_mode = is_state('input_select.tesla_charge_scheduling', 'Car charge schedules') -%}
     {%- set reqs = state_attr('sensor.tesla_charge_requests', 'requests') -%}{%- set reqs = reqs if reqs is mapping else {} -%}
     {%- set hc = namespace(n=0) -%}{%- for s in (ch if ch is list else []) -%}{%- if distance(s.latitude, s.longitude, 'zone.home') <= [state_attr('zone.home', 'radius') | default(100) / 1000, 0.5] | max -%}{%- set hc.n = hc.n + 1 -%}{%- endif -%}{%- endfor -%}
@@ -35,7 +38,7 @@ cards:
     {% else %}| Ready at | Days | Repeat | On | Charge | Where |
     |:--|:--|:--|:--:|:--|:--|
     {% for s in pre | sort(attribute='precondition_time') -%}
-    | **{{ s['*precondition_time'] }}** | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ chg(s, reqs, car_mode) }} | {{ loc(s) }} |
+    | **{{ s['*precondition_time'] }}**{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ chg(s, reqs, car_mode) }} | {{ loc(s) }} |
     {% endfor %}{% endif %}
 
     ### 🔌 Charging
@@ -45,7 +48,7 @@ cards:
     {% else %}| Start | End | Days | Repeat | On | Where |
     |:--|:--|:--|:--|:--:|:--|
     {% for s in ch | sort(attribute='start_time') -%}
-    | **{{ s['*start_time'] if s.start_enabled else '–' }}**{{ ' 🔗' if s.name is match('pc:\d+$') else '' }} | {{ s['*end_time'] if s.end_enabled else '–' }} | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ loc(s) }} |
+    | **{{ s['*start_time'] if s.start_enabled else '–' }}**{{ ' 🔗' if s.name is match('pc:\d+$') else '' }}{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*end_time'] if s.end_enabled else '–' }} | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ loc(s) }} |
     {% endfor %}
     {% if ch | selectattr('name', 'match', 'pc:\d+$') | list | count > 0 %}<small>🔗 = linked to a preconditioning schedule</small>
     {% endif %}{% endif %}
@@ -53,7 +56,9 @@ cards:
     ⚠️ **Charge scheduling is set to External planner, but the car has its own charge schedules at Home: they may stop or start charging against the planner.**
     {% endif %}
 
-    {% set t = state_attr('sensor.tesla_precondition_schedules', 'read_at') | as_datetime(none) %}
+    {% if q | count > 0 %}⏳ **{{ q | count }} change{{ 's' if q | count > 1 else '' }} waiting for the car**: sent when it is next in range{{ ' (' ~ (q | selectattr('op', 'eq', 'delete') | list | count) ~ ' to delete)' if q | selectattr('op', 'eq', 'delete') | list | count else '' }}
+
+    {% endif %}{% set t = state_attr('sensor.tesla_precondition_schedules', 'read_at') | as_datetime(none) %}
     {%- if t is none %}⚠️ **Not read from the car yet: tap Refresh**
     {%- elif now() - t > timedelta(hours=6) %}⚠️ **Read {{ relative_time(t) }} ago: may be out of date, tap Refresh**
     {%- else %}<small>Read {{ relative_time(t) }} ago</small>{% endif %}
@@ -118,6 +123,9 @@ cards:
         {%- macro chg(s, reqs, car_mode) -%}{%- set r = reqs.get(s.id | string) -%}{{- (r.start ~ '–' ~ r.end ~ ((' → ' ~ r.target ~ '%') if r.target else '') ~ (' · car' if car_mode else ' · planner')) if r else '–' -}}{%- endmacro -%}
         {%- set ch = state_attr('sensor.tesla_charge_schedules', 'schedules') -%}
         {%- set pre = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
+        {%- set q = state_attr('sensor.tesla_schedule_queue', 'pending') or [] -%}
+        {%- set mp = state_attr('sensor.tesla_schedule_queue', 'precondition_schedules') -%}{%- set pre = mp if mp is list and (pre is list or q) else pre -%}
+        {%- set mc = state_attr('sensor.tesla_schedule_queue', 'charge_schedules') -%}{%- set ch = mc if mc is list and (ch is list or q) else ch -%}
         {%- set car_mode = is_state('input_select.tesla_charge_scheduling', 'Car charge schedules') -%}
         {%- set reqs = state_attr('sensor.tesla_charge_requests', 'requests') -%}{%- set reqs = reqs if reqs is mapping else {} -%}
         {%- set hc = namespace(n=0) -%}{%- for s in (ch if ch is list else []) -%}{%- if distance(s.latitude, s.longitude, 'zone.home') <= [state_attr('zone.home', 'radius') | default(100) / 1000, 0.5] | max -%}{%- set hc.n = hc.n + 1 -%}{%- endif -%}{%- endfor -%}
@@ -132,7 +140,7 @@ cards:
         {% else %}| Ready at | Days | Repeat | On | Charge | Where |
         |:--|:--|:--|:--:|:--|:--|
         {% for s in pre | sort(attribute='precondition_time') -%}
-        | **{{ s['*precondition_time'] }}** | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ chg(s, reqs, car_mode) }} | {{ loc(s) }} |
+        | **{{ s['*precondition_time'] }}**{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ chg(s, reqs, car_mode) }} | {{ loc(s) }} |
         {% endfor %}{% endif %}
 
         ### 🔌 Charging
@@ -142,7 +150,7 @@ cards:
         {% else %}| Start | End | Days | Repeat | On | Where |
         |:--|:--|:--|:--|:--:|:--|
         {% for s in ch | sort(attribute='start_time') -%}
-        | **{{ s['*start_time'] if s.start_enabled else '–' }}**{{ ' 🔗' if s.name is match('pc:\d+$') else '' }} | {{ s['*end_time'] if s.end_enabled else '–' }} | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ loc(s) }} |
+        | **{{ s['*start_time'] if s.start_enabled else '–' }}**{{ ' 🔗' if s.name is match('pc:\d+$') else '' }}{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*end_time'] if s.end_enabled else '–' }} | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ loc(s) }} |
         {% endfor %}
         {% if ch | selectattr('name', 'match', 'pc:\d+$') | list | count > 0 %}<small>🔗 = linked to a preconditioning schedule</small>
         {% endif %}{% endif %}
@@ -150,7 +158,9 @@ cards:
         ⚠️ **Charge scheduling is set to External planner, but the car has its own charge schedules at Home: they may stop or start charging against the planner.**
         {% endif %}
 
-        {% set t = state_attr('sensor.tesla_precondition_schedules', 'read_at') | as_datetime(none) %}
+        {% if q | count > 0 %}⏳ **{{ q | count }} change{{ 's' if q | count > 1 else '' }} waiting for the car**: sent when it is next in range{{ ' (' ~ (q | selectattr('op', 'eq', 'delete') | list | count) ~ ' to delete)' if q | selectattr('op', 'eq', 'delete') | list | count else '' }}
+
+        {% endif %}{% set t = state_attr('sensor.tesla_precondition_schedules', 'read_at') | as_datetime(none) %}
         {%- if t is none %}⚠️ **Not read from the car yet: tap Refresh**
         {%- elif now() - t > timedelta(hours=6) %}⚠️ **Read {{ relative_time(t) }} ago: may be out of date, tap Refresh**
         {%- else %}<small>Read {{ relative_time(t) }} ago</small>{% endif %}

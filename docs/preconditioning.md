@@ -89,6 +89,16 @@ How it works: the *sync list* automation rebuilds the dropdown whenever a schedu
 > [!NOTE]
 > The car keeps a one-time schedule in its list after it has run. Delete old ones now and then: the list is limited to about ten schedules of each type (see above). `sensor.tesla_next_departure` (below) already ignores one-time schedules that have run.
 
+#### Changes while the car is away
+The set and delete scripts (and so the editor) work when the car is out of BLE range too. If the car can't be reached (out of range, or it doesn't wake within 60 s) the change goes into `sensor.tesla_schedule_queue` instead and is sent by the *upload queued changes* automation as soon as the car is back in range. That automation wakes the car when it comes into range, so a departure added while you are away still gets set, even shortly before it. Until then:
+
+- the card and the editor show the schedules as they will be, with queued ones marked ⏳, and a line saying how many changes are waiting;
+- `sensor.tesla_next_departure` already includes queued departures (with `pending: true`), so an external planner can plan for them;
+- editing a queued schedule replaces the queued change, and deleting it just removes it from the queue;
+- a queued one-time schedule whose time has passed is dropped (it would never run); weekly ones are kept.
+
+The queue survives Home Assistant restarts. Changes made in the Tesla app meanwhile are not merged: the last one to reach the car wins.
+
 #### Charging for a departure
 A precondition schedule can also ask for charging before the departure. In the editor, turn on **Also charge for this departure** and set **Charge from**, **Charge until** and **Charge to** (the target %, which starts at the car's current charge limit). The default window is the 6 hours before the ready time, and it moves with the ready time when you change that. The car has no field for this, so the request is kept in Home Assistant: `sensor.tesla_charge_requests` (attribute `requests`, keyed by the precondition schedule's ID). It survives restarts, follows the schedule when you edit it, and is removed when you delete the schedule here (or 7 days after the schedule disappears from the car's list, if it was deleted in the Tesla app).
 
