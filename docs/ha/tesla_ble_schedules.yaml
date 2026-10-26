@@ -8,6 +8,8 @@
 #     departure's charge request. Meant for external charging planners (no bitmask/one-time parsing needed)
 #   - scripts to wake the car, refresh the lists, add/edit/delete schedules and precondition now
 #   - an automation that re-reads the lists whenever the car is awake and the last read is over an hour old
+#   - an offline queue: saves and deletes made while the car is out of reach are kept in
+#     sensor.tesla_schedule_queue and sent when it is next in range (one-time schedules that have passed are dropped)
 #   - "also charge for this departure" on precondition schedules, handled either by a linked car charge
 #     schedule or by an external planner (input_select.tesla_charge_scheduling)
 #   - a schedule editor (helpers + automations) used by docs/ha/tesla_ble_dashboard.yaml
@@ -100,12 +102,115 @@ template:
         attributes:
           requests: "{{ requests }}"
 
+  # Changes waiting for the car: saves and deletes made while it was out of reach. `pending` is a list of
+  # {kind, op, schedule_id, payload, queued_at}; payload is the ESPHome action data. A newer change to the same
+  # schedule replaces an older one. Saves of one-time schedules whose run has passed are dropped. Also publishes
+  # the schedule lists as they will be once uploaded (`precondition_schedules`, `charge_schedules`; queued
+  # entries have `pending: true`), which the editor, the card and sensor.tesla_next_departure use.
+  - triggers:
+      - trigger: event
+        event_type: tesla_ble_schedule_queue
+      - trigger: state
+        entity_id:
+          - sensor.tesla_precondition_schedules
+          - sensor.tesla_charge_schedules
+      - trigger: time_pattern
+        minutes: "/15"
+      - trigger: homeassistant
+        event: start
+    actions:
+      - variables:
+          car_pre: >-
+            {%- set p = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}{{ p if p is list else [] -}}
+          car_ch: >-
+            {%- set c = state_attr('sensor.tesla_charge_schedules', 'schedules') -%}{{ c if c is list else [] -}}
+          pending: >-
+            {#- `this` is not available in actions: read the previous value from the state machine -#}
+            {%- set old = state_attr('sensor.tesla_schedule_queue', 'pending') -%}
+            {%- set ns = namespace(l=old if old is list else []) -%}
+            {%- if trigger.platform == 'event' -%}
+              {%- set e = trigger.event.data -%}
+              {%- set sid = e.schedule_id | string -%}
+              {%- set keep = namespace(l=[]) -%}
+              {%- for i in ns.l -%}
+                {%- set same = i.kind == e.kind and i.schedule_id | string == sid -%}
+                {%- if not same or (e.action == 'remove' and e.queued_at is defined and i.queued_at != e.queued_at) -%}
+                  {%- set keep.l = keep.l + [i] -%}{%- endif -%}
+              {%- endfor -%}
+              {%- set ns.l = keep.l -%}
+              {%- if e.action == 'add' -%}
+                {%- set on_car = ((car_pre if e.kind == 'precondition' else car_ch) | map(attribute='id') | map('string') | list) -%}
+                {#- deleting a schedule that only existed in the queue just drops it from the queue -#}
+                {%- if e.op != 'delete' or sid in on_car -%}
+                  {%- set ns.l = ns.l + [{'kind': e.kind, 'op': e.op, 'schedule_id': sid, 'payload': e.payload | default({}),
+                                         'queued_at': now().isoformat()}] -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endif -%}
+            {#- drop saves of one-time schedules whose (only) run has passed -#}
+            {%- set out = namespace(l=[]) -%}
+            {%- for i in ns.l -%}
+              {%- set p = i.payload -%}
+              {%- set past = false -%}
+              {%- if i.op == 'set' and p.one_time | default(false) -%}
+                {%- set t = p.precondition_time if i.kind == 'precondition'
+                            else (p.end_time if p.end_enabled | default(true) else p.start_time) -%}
+                {%- set created = as_local(as_datetime(i.schedule_id | int)) -%}
+                {%- set r = created.replace(hour=(t // 60) % 24, minute=t % 60, second=0, microsecond=0) -%}
+                {%- set r = r + timedelta(days=1) if r <= created else r -%}
+                {%- set past = r < now() -%}
+              {%- endif -%}
+              {%- if not past -%}{%- set out.l = out.l + [i] -%}{%- endif -%}
+            {%- endfor -%}
+            {{- out.l -}}
+      - variables:
+          # The car's lists with the queued changes applied, in the car's own format
+          merged: >-
+            {%- macro days(b) -%}
+              {%- set n = namespace(l=[]) -%}
+              {%- for d in ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] -%}
+                {%- if (b // (2 ** loop.index0)) % 2 == 1 -%}{%- set n.l = n.l + [d] -%}{%- endif -%}
+              {%- endfor -%}{{- n.l | join(', ') -}}
+            {%- endmacro -%}
+            {%- macro hhmm(t) -%}{{- '%02d:%02d' % ((t // 60) % 24, t % 60) -}}{%- endmacro -%}
+            {%- set out = namespace(pre=[], ch=[]) -%}
+            {%- for kind, car in [('precondition', car_pre), ('charge', car_ch)] -%}
+              {%- set q = pending | selectattr('kind', 'eq', kind) | list -%}
+              {%- set qids = q | map(attribute='schedule_id') | map('int') | list -%}
+              {%- set ns = namespace(l=car | rejectattr('id', 'in', qids) | list) -%}
+              {%- for i in q if i.op == 'set' -%}
+                {%- set p = i.payload -%}
+                {%- set e = {'id': i.schedule_id | int, 'name': p.name | default(''), 'days': p.days_of_week,
+                             '*days': days(p.days_of_week), 'one_time': p.one_time, 'enabled': p.enabled,
+                             'latitude': p.latitude, 'longitude': p.longitude, 'pending': true} -%}
+                {%- if kind == 'precondition' -%}
+                  {%- set e = dict(e, precondition_time=p.precondition_time, **{'*precondition_time': hhmm(p.precondition_time)}) -%}
+                {%- else -%}
+                  {%- set e = dict(e, start_enabled=p.start_enabled, start_time=p.start_time, end_enabled=p.end_enabled,
+                                   end_time=p.end_time, **{'*start_time': hhmm(p.start_time), '*end_time': hhmm(p.end_time)}) -%}
+                {%- endif -%}
+                {%- set ns.l = ns.l + [e] -%}
+              {%- endfor -%}
+              {%- if kind == 'precondition' -%}{%- set out.pre = ns.l -%}{%- else -%}{%- set out.ch = ns.l -%}{%- endif -%}
+            {%- endfor -%}
+            {{- {'precondition': out.pre, 'charge': out.ch} -}}
+    sensor:
+      - name: Tesla schedule queue
+        unique_id: tesla_schedule_queue
+        icon: mdi:timer-sand
+        state: "{{ pending | count }}"
+        attributes:
+          pending: "{{ pending }}"
+          precondition_schedules: "{{ merged.precondition }}"
+          charge_schedules: "{{ merged.charge }}"
+
   # Next departures resolved from the precondition schedules (one-time schedules by their creation time).
   - triggers:
       - trigger: state
         entity_id:
           - sensor.tesla_precondition_schedules
           - sensor.tesla_charge_requests
+          - sensor.tesla_schedule_queue
       - trigger: state
         entity_id: input_select.tesla_charge_scheduling
       - trigger: time_pattern
@@ -115,7 +220,7 @@ template:
     actions:
       - variables:
           upcoming: >-
-            {%- set pre = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
+            {%- set pre = state_attr('sensor.tesla_schedule_queue', 'precondition_schedules') -%}{%- set pre = pre if pre is list else state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
             {%- set pre = pre if pre is list else [] -%}
             {%- set reqs = state_attr('sensor.tesla_charge_requests', 'requests') -%}
             {%- set reqs = reqs if reqs is mapping else {} -%}
@@ -160,7 +265,8 @@ template:
                       'charge': rq is not none,
                       'charge_start': st.isoformat() if rq else none,
                       'charge_end': e.isoformat() if rq else none,
-                      'charge_target': (rq.target | int) if rq and rq.target else none}] -%}
+                      'charge_target': (rq.target | int) if rq and rq.target else none,
+                      'pending': s.pending | default(false)}] -%}
               {%- endfor -%}
             {%- endfor -%}
             {{- out.l | sort(attribute='at') -}}
@@ -279,6 +385,47 @@ script:
       - delay:
           seconds: 5   # let the infotainment system settle before commands arrive
 
+  tesla_try_wake:
+    alias: Tesla - try to wake
+    description: >-
+      Like "ensure awake", but never fails: returns {awake: true/false}. Gives up at once when the car is out of
+      BLE range. Used by the set and delete scripts, which queue the change when the car can't be reached.
+    icon: mdi:sleep-off
+    mode: parallel
+    sequence:
+      - variables:
+          result: { awake: false }
+      - if:
+          - condition: state
+            entity_id: binary_sensor.tesla_ble_ble_status
+            state: "off"
+        then:
+          - stop: Car out of BLE range
+            response_variable: result
+      - if:
+          - condition: state
+            entity_id: binary_sensor.tesla_ble_asleep
+            state: "on"
+        then:
+          - action: button.press
+            target:
+              entity_id: button.tesla_ble_wake_up
+          - wait_template: "{{ is_state('binary_sensor.tesla_ble_asleep', 'off') }}"
+            timeout:
+              seconds: 60
+            continue_on_timeout: true
+          - if:
+              - condition: state
+                entity_id: binary_sensor.tesla_ble_asleep
+                state: "off"
+            then:
+              - delay:
+                  seconds: 5   # let the infotainment system settle before commands arrive
+      - variables:
+          result: { awake: "{{ is_state('binary_sensor.tesla_ble_asleep', 'off') }}" }
+      - stop: Done
+        response_variable: result
+
   tesla_refresh_schedules:
     alias: Tesla - refresh schedule lists
     description: Reads both schedule lists from the car; the sensors update when the events arrive.
@@ -313,7 +460,8 @@ script:
       Adds a preconditioning (departure) schedule, or edits the one with the given ID. The car only runs a
       schedule when it is parked near its location: pick a zone, or give latitude/longitude (these win).
       Optionally also requests charging for the departure (see the top of this file); leaving "Charge" out
-      keeps the schedule's current request. Fires `tesla_ble_departure_changed`.
+      keeps the schedule's current request. Fires `tesla_ble_departure_changed`. If the car can't be reached,
+      the change is queued and sent when it is next in range.
     icon: mdi:car-clock
     mode: queued
     fields:
@@ -393,20 +541,32 @@ script:
             {{- {'start': charge_start[:5], 'end': (charge_end | default(time, true))[:5],
                  'target': (charge_target | int) if charge_target | default(none) is number else none} -}}
             {%- else -%}{{ none -}}{%- endif -%}
-      - action: script.tesla_ensure_awake
-      - action: esphome.tesla_ble_set_precondition_schedule
-        data:
-          schedule_id: "{{ sid }}"
-          name: "{{ name | default('') }}"
-          days_of_week: "{{ bits }}"
-          precondition_time: "{{ (time.split(':')[0] | int) * 60 + (time.split(':')[1] | int) }}"
-          one_time: "{{ one_time | default(true) }}"
-          enabled: "{{ enabled | default(true) }}"
-          latitude: "{{ lat | float }}"
-          longitude: "{{ lon | float }}"
+          payload:
+            schedule_id: "{{ sid }}"
+            name: "{{ name | default('') }}"
+            days_of_week: "{{ bits }}"
+            precondition_time: "{{ (time.split(':')[0] | int) * 60 + (time.split(':')[1] | int) }}"
+            one_time: "{{ one_time | default(true) }}"
+            enabled: "{{ enabled | default(true) }}"
+            latitude: "{{ lat | float }}"
+            longitude: "{{ lon | float }}"
+      - &send_or_queue
+        action: script.tesla_try_wake
+        response_variable: wake
+      - if:
+          - "{{ wake.awake }}"
+        then:
+          - action: esphome.tesla_ble_set_precondition_schedule
+            data: "{{ payload }}"
+          - event: tesla_ble_schedule_queue   # this change supersedes anything queued for the schedule
+            event_data: { action: remove, kind: precondition, schedule_id: "{{ sid }}" }
+        else:
+          - event: tesla_ble_schedule_queue
+            event_data: { action: add, kind: precondition, op: set, schedule_id: "{{ sid }}", payload: "{{ payload }}" }
       - event: tesla_ble_departure_changed
         event_data:
           change: saved
+          queued: "{{ not wake.awake }}"
           schedule_id: "{{ sid | int }}"
           ready_time: "{{ time }}"
           days: "{{ days }}"
@@ -423,7 +583,8 @@ script:
     alias: Tesla - add or edit charge schedule
     description: >-
       Adds a charging schedule, or edits the one with the given ID. Charge schedules named `pc:<id>` are
-      managed by the linked-charging automation; edit their precondition schedule instead.
+      managed by the linked-charging automation; edit their precondition schedule instead. If the car can't
+      be reached, the change is queued and sent when it is next in range.
     icon: mdi:ev-station
     mode: queued
     fields:
@@ -486,26 +647,41 @@ script:
         selector: { number: { min: -180, max: 180, step: any, mode: box } }
     sequence:
       - variables: *schedule_common_vars
-      - action: script.tesla_ensure_awake
-      - action: esphome.tesla_ble_edit_charge_schedule
-        data:
-          schedule_id: "{{ schedule_id | default('') }}"
-          name: "{{ name | default('') }}"
-          days_of_week: "{{ bits }}"
-          start_enabled: "{{ start_enabled | default(true) }}"
-          start_time: "{{ (time.split(':')[0] | int) * 60 + (time.split(':')[1] | int) }}"
-          end_enabled: "{{ end_enabled | default(true) }}"
-          end_time: "{{ (end_time.split(':')[0] | int) * 60 + (end_time.split(':')[1] | int) }}"
-          one_time: "{{ one_time | default(true) }}"
-          enabled: "{{ enabled | default(true) }}"
-          latitude: "{{ lat | float }}"
-          longitude: "{{ lon | float }}"
+      - variables:
+          # New schedules get their ID here (the creation time), so a queued one can be edited before upload
+          sid: "{{ schedule_id if schedule_id | default('') | string != '' else (as_timestamp(now()) | int) | string }}"
+      - variables:
+          payload:
+            schedule_id: "{{ sid }}"
+            name: "{{ name | default('') }}"
+            days_of_week: "{{ bits }}"
+            start_enabled: "{{ start_enabled | default(true) }}"
+            start_time: "{{ (time.split(':')[0] | int) * 60 + (time.split(':')[1] | int) }}"
+            end_enabled: "{{ end_enabled | default(true) }}"
+            end_time: "{{ (end_time.split(':')[0] | int) * 60 + (end_time.split(':')[1] | int) }}"
+            one_time: "{{ one_time | default(true) }}"
+            enabled: "{{ enabled | default(true) }}"
+            latitude: "{{ lat | float }}"
+            longitude: "{{ lon | float }}"
+      - *send_or_queue
+      - if:
+          - "{{ wake.awake }}"
+        then:
+          - action: esphome.tesla_ble_edit_charge_schedule
+            data: "{{ payload }}"
+          - event: tesla_ble_schedule_queue
+            event_data: { action: remove, kind: charge, schedule_id: "{{ sid }}" }
+        else:
+          - event: tesla_ble_schedule_queue
+            event_data: { action: add, kind: charge, op: set, schedule_id: "{{ sid }}", payload: "{{ payload }}" }
 
   tesla_delete_schedule:
     alias: Tesla - delete schedule
     description: >-
       Deletes one charge or precondition schedule by ID. The list is re-read automatically, and a linked
-      charge schedule of a deleted precondition schedule is removed by the linked-charging automation.
+      charge schedule of a deleted precondition schedule is removed by the linked-charging automation. If the
+      car can't be reached, the delete is queued (or, for a schedule that was itself still queued, it is just
+      dropped from the queue).
     icon: mdi:delete-clock
     mode: queued
     fields:
@@ -523,15 +699,26 @@ script:
         required: true
         selector: { text: }
     sequence:
-      - action: script.tesla_ensure_awake
+      - *send_or_queue
       - if:
-          - "{{ kind == 'charge' }}"   # compares a field value: no native condition for it
+          - "{{ not wake.awake }}"
         then:
-          - action: esphome.tesla_ble_delete_charge_schedule
-            data: { schedule_id: "{{ schedule_id }}" }
+          - event: tesla_ble_schedule_queue
+            event_data: { action: add, kind: "{{ kind }}", op: delete, schedule_id: "{{ schedule_id }}" }
         else:
-          - action: esphome.tesla_ble_delete_precondition_schedule
-            data: { schedule_id: "{{ schedule_id }}" }
+          - if:
+              - "{{ kind == 'charge' }}"   # compares a field value: no native condition for it
+            then:
+              - action: esphome.tesla_ble_delete_charge_schedule
+                data: { schedule_id: "{{ schedule_id }}" }
+            else:
+              - action: esphome.tesla_ble_delete_precondition_schedule
+                data: { schedule_id: "{{ schedule_id }}" }
+          - event: tesla_ble_schedule_queue
+            event_data: { action: remove, kind: "{{ kind }}", schedule_id: "{{ schedule_id }}" }
+      - if:
+          - "{{ kind == 'precondition' }}"
+        then:
           - event: tesla_ble_departure_changed
             event_data:
               change: deleted
@@ -559,8 +746,8 @@ script:
             {%- endfor -%}
             {{- ns.l -}}
           existing: >-
-            {%- set p = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
-            {%- set c = state_attr('sensor.tesla_charge_schedules', 'schedules') -%}
+            {%- set p = state_attr('sensor.tesla_schedule_queue', 'precondition_schedules') -%}{%- set p = p if p is list else state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
+            {%- set c = state_attr('sensor.tesla_schedule_queue', 'charge_schedules') -%}{%- set c = c if c is list else state_attr('sensor.tesla_charge_schedules', 'schedules') -%}
             {%- set all = (p if p is list else []) + (c if c is list else []) -%}
             {{- (all | selectattr('id', 'eq', sid | int(0)) | list | first) | default({}) -}}
           loc_sel: "{{ states('input_select.tesla_schedule_location') }}"
@@ -669,6 +856,75 @@ automation:
     actions:
       - action: esphome.tesla_ble_get_charge_schedules
       - action: esphome.tesla_ble_get_precondition_schedules
+
+  - id: tesla_schedule_queue_upload
+    alias: Tesla schedules - upload queued changes
+    description: >-
+      Sends the changes queued while the car was out of reach (sensor.tesla_schedule_queue), oldest first, as
+      soon as the car is in BLE range: waking it when it comes into range or when a change is queued while it is
+      in range, so an upcoming departure still gets set even shortly before it. The periodic retry only runs
+      while the car is already awake. One-time schedules whose run has passed were already dropped from the queue.
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.tesla_ble_ble_status
+        to: "on"
+        for: { seconds: 30 }
+        id: wake
+      - trigger: state
+        entity_id: sensor.tesla_schedule_queue
+        id: wake
+      - trigger: state
+        entity_id: binary_sensor.tesla_ble_asleep
+        to: "off"
+        for: { seconds: 30 }
+      - trigger: time_pattern
+        minutes: "/10"
+    conditions:
+      - condition: numeric_state
+        entity_id: sensor.tesla_schedule_queue
+        above: 0
+      - condition: state
+        entity_id: binary_sensor.tesla_ble_ble_status
+        state: "on"
+      - condition: or
+        conditions:
+          - condition: trigger
+            id: wake
+          - condition: state
+            entity_id: binary_sensor.tesla_ble_asleep
+            state: "off"
+    actions:
+      - action: script.tesla_try_wake
+        response_variable: wake
+      - condition: template
+        value_template: "{{ wake.awake }}"
+      - repeat:
+          for_each: "{{ state_attr('sensor.tesla_schedule_queue', 'pending') or [] }}"
+          sequence:
+            - choose:
+                - conditions: "{{ repeat.item.op == 'delete' and repeat.item.kind == 'charge' }}"
+                  sequence:
+                    - action: esphome.tesla_ble_delete_charge_schedule
+                      data: { schedule_id: "{{ repeat.item.schedule_id }}" }
+                - conditions: "{{ repeat.item.op == 'delete' }}"
+                  sequence:
+                    - action: esphome.tesla_ble_delete_precondition_schedule
+                      data: { schedule_id: "{{ repeat.item.schedule_id }}" }
+                - conditions: "{{ repeat.item.kind == 'charge' }}"
+                  sequence:
+                    - action: esphome.tesla_ble_edit_charge_schedule
+                      data: "{{ repeat.item.payload }}"
+              default:
+                - action: esphome.tesla_ble_set_precondition_schedule
+                  data: "{{ repeat.item.payload }}"
+            - event: tesla_ble_schedule_queue   # only this exact entry: a newer change to the schedule stays queued
+              event_data:
+                action: remove
+                kind: "{{ repeat.item.kind }}"
+                schedule_id: "{{ repeat.item.schedule_id }}"
+                queued_at: "{{ repeat.item.queued_at }}"
 
   - id: tesla_linked_charging_reconcile
     alias: Tesla schedules - keep linked charge schedules in step
@@ -819,6 +1075,7 @@ automation:
           - sensor.tesla_precondition_schedules
           - sensor.tesla_charge_schedules
           - sensor.tesla_charge_requests
+          - sensor.tesla_schedule_queue
       - trigger: state
         entity_id: input_select.tesla_charge_scheduling
       - trigger: state   # reloading input selects resets the options to the two "New" entries
@@ -833,9 +1090,9 @@ automation:
           reqs: >-
             {%- set r = state_attr('sensor.tesla_charge_requests', 'requests') -%}{{ r if r is mapping else {} -}}
           pre: >-
-            {%- set p = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}{{ p if p is list else [] -}}
+            {%- set p = state_attr('sensor.tesla_schedule_queue', 'precondition_schedules') -%}{%- set p = p if p is list else state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}{{ p if p is list else [] -}}
           ch: >-
-            {%- set c = state_attr('sensor.tesla_charge_schedules', 'schedules') -%}{{ c if c is list else [] -}}
+            {%- set c = state_attr('sensor.tesla_schedule_queue', 'charge_schedules') -%}{%- set c = c if c is list else state_attr('sensor.tesla_charge_schedules', 'schedules') -%}{{ c if c is list else [] -}}
           opts: >-
             {%- macro where(s) -%}
             {%- set z = namespace(best='', d=99999) -%}
@@ -854,12 +1111,12 @@ automation:
             {%- set ns = namespace(o=['➕ New precondition schedule', '➕ New charge schedule']) -%}
             {%- for s in pre | sort(attribute='precondition_time') -%}
             {%- set ns.o = ns.o + ['🌡️ ' ~ s['*precondition_time'] ~ ' · ' ~ s['*days'] ~ ' · '
-                 ~ ('Once' if s.one_time else 'Weekly') ~ ('' if s.enabled else ' · paused') ~ charge(s) ~ where(s) ~ ' · #' ~ s.id] -%}
+                 ~ ('Once' if s.one_time else 'Weekly') ~ ('' if s.enabled else ' · paused') ~ charge(s) ~ where(s) ~ (' · ⏳' if s.pending | default(false) else '') ~ ' · #' ~ s.id] -%}
             {%- endfor -%}
             {%- for s in ch | rejectattr('name', 'match', 'pc:\\d+$') | sort(attribute='start_time') -%}
             {%- set ns.o = ns.o + ['🔌 ' ~ ((s['*start_time'] ~ '–' ~ s['*end_time']) if s.start_enabled and s.end_enabled
                  else ('from ' ~ s['*start_time']) if s.start_enabled else ('until ' ~ s['*end_time'])) ~ ' · ' ~ s['*days'] ~ ' · '
-                 ~ ('Once' if s.one_time else 'Weekly') ~ ('' if s.enabled else ' · paused') ~ where(s) ~ ' · #' ~ s.id] -%}
+                 ~ ('Once' if s.one_time else 'Weekly') ~ ('' if s.enabled else ' · paused') ~ where(s) ~ (' · ⏳' if s.pending | default(false) else '') ~ ' · #' ~ s.id] -%}
             {%- endfor -%}
             {{- ns.o -}}
       - action: input_select.set_options
@@ -892,9 +1149,9 @@ automation:
           sel: "{{ trigger.to_state.state }}"
           sid: "{{ sel.split('#')[-1] if '#' in sel else '' }}"
           pre: >-
-            {%- set p = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}{{ p if p is list else [] -}}
+            {%- set p = state_attr('sensor.tesla_schedule_queue', 'precondition_schedules') -%}{%- set p = p if p is list else state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}{{ p if p is list else [] -}}
           ch: >-
-            {%- set c = state_attr('sensor.tesla_charge_schedules', 'schedules') -%}{{ c if c is list else [] -}}
+            {%- set c = state_attr('sensor.tesla_schedule_queue', 'charge_schedules') -%}{%- set c = c if c is list else state_attr('sensor.tesla_charge_schedules', 'schedules') -%}{{ c if c is list else [] -}}
           match_pre: "{{ pre | selectattr('id', 'eq', sid | int(0)) | list }}"
           match_ch: "{{ ch | selectattr('id', 'eq', sid | int(0)) | list }}"
           kind: "{{ 'charge' if (sel == '➕ New charge schedule' or match_ch | count > 0) else 'precondition' }}"

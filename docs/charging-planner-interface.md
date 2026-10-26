@@ -40,13 +40,14 @@ A trigger-based template sensor. It updates when the car's precondition list cha
 | `charge_start` | ISO datetime or `null` | Start of the requested charge window (only when `charge`) |
 | `charge_end` | ISO datetime or `null` | End of the requested charge window; normally equal to `at` |
 | `charge_target` | int (%) or `null` | Requested state of charge; `null` if the request has no target |
+| `pending` | bool | `true` while the schedule is only queued in Home Assistant (the car was out of reach when it was saved); it is sent to the car when the car is next in range |
 
 **Guarantees:**
 - Disabled schedules are left out.
 - A **one-time** schedule appears only for its single run: the first ready time after it was created. The car keeps one-time schedules listed after they have run; the sensor drops them once that run is past. A planner should not parse one-time schedules itself.
 - A **weekly** schedule appears for each matching day in the window (today and the next three days, cut at 72 h).
 - `charge_start` ≤ `charge_end` ≤ `at`; a window crossing midnight is resolved to the right dates.
-- Only schedules the car reported are included: the list is as fresh as `sensor.tesla_precondition_schedules` → `read_at` (below).
+- Schedules the car reported, with changes still queued for the car applied (`pending: true`): the car's part is as fresh as `sensor.tesla_precondition_schedules` → `read_at` (below). A queued delete already removes the departure.
 
 **Typical use:** the earliest entry with `location == 'zone.home'` and `charge == true` is the next charging deadline (`charge_end`) and target (`charge_target`). The planner may ignore `charge_start` (it is the user's preference, not a constraint) and may use its own target instead.
 
@@ -56,7 +57,7 @@ A trigger-based template sensor. It updates when the car's precondition list cha
 
 ## 4. Event: `tesla_ble_departure_changed`
 
-Fired by `script.tesla_set_precondition_schedule` and `script.tesla_delete_schedule` (which the schedule editor uses) right after a precondition schedule is saved or deleted, before the car's updated list has been read back. Use it to replan sooner; `sensor.tesla_next_departure` remains the source of truth and follows within seconds to a minute.
+Fired by `script.tesla_set_precondition_schedule` and `script.tesla_delete_schedule` (which the schedule editor uses) right after a precondition schedule is saved or deleted, before the car's updated list has been read back. When the car can't be reached the change is queued and the event carries `queued: true`; the departure appears in the sensor right away anyway. Use it to replan sooner; `sensor.tesla_next_departure` remains the source of truth and follows within seconds to a minute.
 
 | Field | `change: saved` | `change: deleted` |
 | --- | --- | --- |
@@ -69,6 +70,7 @@ Fired by `script.tesla_set_precondition_schedule` and `script.tesla_delete_sched
 | `charge_start`, `charge_end` | `HH:MM` or `null` | — |
 | `charge_target` | int or `null` | — |
 | `latitude`, `longitude` | float | — |
+| `queued` | bool: `true` if the car was out of reach and the change waits in `sensor.tesla_schedule_queue` | — |
 
 Schedules changed outside these scripts (Tesla app, the car's screen, direct ESPHome action calls) do not fire this event; they show up in the sensor after the next read.
 
