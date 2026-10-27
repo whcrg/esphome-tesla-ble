@@ -377,3 +377,5 @@ cards:
       entities:
       - entity: input_select.tesla_charge_scheduling
         name: Charge scheduling
+      - entity: input_select.tesla_one_time_cleanup
+        name: One-time schedules after they run
