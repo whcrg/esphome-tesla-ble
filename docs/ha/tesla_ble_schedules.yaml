@@ -10,6 +10,7 @@
 #   - an automation that re-reads the lists whenever the car is awake and the last read is over an hour old
 #   - an offline queue: saves and deletes made while the car is out of reach are kept in
 #     sensor.tesla_schedule_queue and sent when it is next in range (one-time schedules that have passed are dropped)
+#   - optional cleanup of one-time schedules that have run (the car keeps them; input_select.tesla_one_time_cleanup)
 #   - "also charge for this departure" on precondition schedules, handled either by a linked car charge
 #     schedule or by an external planner (input_select.tesla_charge_scheduling)
 #   - a schedule editor (helpers + automations) used by docs/ha/tesla_ble_dashboard.yaml
@@ -200,16 +201,18 @@ template:
               {%- set saved = saved if saved is mapping and kind == 'precondition' else {} -%}
               {%- set ns = namespace(l=[]) -%}
               {%- for s in car | rejectattr('id', 'in', qids) -%}
-                {%- set ran = false -%}
+                {%- set run = none -%}
                 {%- if s.one_time -%}
                   {%- set t = s.precondition_time if kind == 'precondition' else (s.end_time if s.end_enabled else s.start_time) -%}
                   {%- set base = as_local(as_datetime(s.id)) if s.id >= 1600000000 else now() -%}
                   {%- set sv = saved.get(s.id | string) | as_datetime(none) -%}
                   {%- if sv -%}{%- set base = [base, as_local(sv)] | max -%}{%- endif -%}
                   {%- set r = base.replace(hour=(t // 60) % 24, minute=t % 60, second=0, microsecond=0) -%}
-                  {%- set ran = (r + timedelta(days=1) if r <= base else r) < now() -%}
+                  {%- set run = r + timedelta(days=1) if r <= base else r -%}
                 {%- endif -%}
-                {%- set ns.l = ns.l + [dict(s, ran=ran)] -%}
+                {%- set ran = run is not none and run < now() -%}
+                {#- ran_at: when it ran (used by the one-time cleanup) -#}
+                {%- set ns.l = ns.l + [dict(s, ran=ran, ran_at=run.isoformat() if ran else none)] -%}
               {%- endfor -%}
               {%- for i in q if i.op == 'set' -%}
                 {%- set p = i.payload -%}
@@ -322,6 +325,14 @@ template:
 
 # ----------------------------------------------------------------------------- settings and editor helpers
 input_select:
+  tesla_one_time_cleanup:
+    name: Tesla one-time schedules
+    icon: mdi:broom
+    # The car keeps one-time schedules (still enabled) after they run. "Delete after they run": the cleanup
+    # automation deletes them from the car 15 min after their run, while the car is awake and in range.
+    options:
+      - Keep in the car
+      - Delete after they run
   tesla_charge_scheduling:
     name: Tesla charge scheduling
     icon: mdi:ev-plug-type2
@@ -966,6 +977,56 @@ automation:
                 kind: "{{ repeat.item.kind }}"
                 schedule_id: "{{ repeat.item.schedule_id }}"
                 queued_at: "{{ repeat.item.queued_at }}"
+
+  - id: tesla_one_time_cleanup
+    alias: Tesla schedules - delete one-time schedules that have run
+    description: >-
+      With "Delete after they run" (input_select.tesla_one_time_cleanup): deletes one-time precondition and charge
+      schedules from the car 15 minutes after they ran. Only while the car is awake and in BLE range, so it never
+      wakes the car for this. Linked charge schedules (`pc:`) are left to the linked-charging automation.
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: state
+        entity_id: sensor.tesla_schedule_queue   # also re-evaluated every 15 min
+      - trigger: state
+        entity_id: binary_sensor.tesla_ble_asleep
+        to: "off"
+        for: { seconds: 30 }
+      - trigger: state
+        entity_id: input_select.tesla_one_time_cleanup
+        to: Delete after they run
+    conditions:
+      - condition: state
+        entity_id: input_select.tesla_one_time_cleanup
+        state: Delete after they run
+      - condition: state
+        entity_id: binary_sensor.tesla_ble_ble_status
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.tesla_ble_asleep
+        state: "off"
+    actions:
+      - variables:
+          done: >-
+            {%- set ns = namespace(l=[]) -%}
+            {%- for kind, attr in [('precondition', 'precondition_schedules'), ('charge', 'charge_schedules')] -%}
+              {%- for s in state_attr('sensor.tesla_schedule_queue', attr) or []
+                  if s.ran | default(false) and not s.name | default('') is match('pc:\\d+$')
+                     and (s.ran_at | as_datetime(now())) < now() - timedelta(minutes=15) -%}
+                {%- set ns.l = ns.l + [{'kind': kind, 'schedule_id': s.id | string}] -%}
+              {%- endfor -%}
+            {%- endfor -%}
+            {{- ns.l -}}
+      - condition: template
+        value_template: "{{ done | count > 0 }}"
+      - repeat:
+          for_each: "{{ done }}"
+          sequence:
+            - action: script.tesla_delete_schedule
+              data:
+                kind: "{{ repeat.item.kind }}"
+                schedule_id: "{{ repeat.item.schedule_id }}"
 
   - id: tesla_linked_charging_reconcile
     alias: Tesla schedules - keep linked charge schedules in step
