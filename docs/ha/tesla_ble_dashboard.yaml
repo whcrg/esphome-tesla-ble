@@ -38,7 +38,7 @@ cards:
     {% else %}| Ready at | Days | Repeat | On | Charge | Where |
     |:--|:--|:--|:--:|:--|:--|
     {% for s in pre | sort(attribute='precondition_time') -%}
-    | **{{ s['*precondition_time'] }}**{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ chg(s, reqs, car_mode) }} | {{ loc(s) }} |
+    | **{{ s['*precondition_time'] }}**{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*days'] }} | {{ (('Once, ran' if s.ran | default(false) else 'Once') if s.one_time else 'Weekly') }} | {{ '✅' if s.enabled else '⏸️' }} | {{ chg(s, reqs, car_mode) }} | {{ loc(s) }} |
     {% endfor %}{% endif %}
 
     ### 🔌 Charging
@@ -48,7 +48,7 @@ cards:
     {% else %}| Start | End | Days | Repeat | On | Where |
     |:--|:--|:--|:--|:--:|:--|
     {% for s in ch | sort(attribute='start_time') -%}
-    | **{{ s['*start_time'] if s.start_enabled else '–' }}**{{ ' 🔗' if s.name is match('pc:\d+$') else '' }}{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*end_time'] if s.end_enabled else '–' }} | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ loc(s) }} |
+    | **{{ s['*start_time'] if s.start_enabled else '–' }}**{{ ' 🔗' if s.name is match('pc:\d+$') else '' }}{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*end_time'] if s.end_enabled else '–' }} | {{ s['*days'] }} | {{ (('Once, ran' if s.ran | default(false) else 'Once') if s.one_time else 'Weekly') }} | {{ '✅' if s.enabled else '⏸️' }} | {{ loc(s) }} |
     {% endfor %}
     {% if ch | selectattr('name', 'match', 'pc:\d+$') | list | count > 0 %}<small>🔗 = linked to a preconditioning schedule</small>
     {% endif %}{% endif %}
@@ -140,7 +140,7 @@ cards:
         {% else %}| Ready at | Days | Repeat | On | Charge | Where |
         |:--|:--|:--|:--:|:--|:--|
         {% for s in pre | sort(attribute='precondition_time') -%}
-        | **{{ s['*precondition_time'] }}**{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ chg(s, reqs, car_mode) }} | {{ loc(s) }} |
+        | **{{ s['*precondition_time'] }}**{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*days'] }} | {{ (('Once, ran' if s.ran | default(false) else 'Once') if s.one_time else 'Weekly') }} | {{ '✅' if s.enabled else '⏸️' }} | {{ chg(s, reqs, car_mode) }} | {{ loc(s) }} |
         {% endfor %}{% endif %}
 
         ### 🔌 Charging
@@ -150,7 +150,7 @@ cards:
         {% else %}| Start | End | Days | Repeat | On | Where |
         |:--|:--|:--|:--|:--:|:--|
         {% for s in ch | sort(attribute='start_time') -%}
-        | **{{ s['*start_time'] if s.start_enabled else '–' }}**{{ ' 🔗' if s.name is match('pc:\d+$') else '' }}{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*end_time'] if s.end_enabled else '–' }} | {{ s['*days'] }} | {{ 'Once' if s.one_time else 'Weekly' }} | {{ '✅' if s.enabled else '⏸️' }} | {{ loc(s) }} |
+        | **{{ s['*start_time'] if s.start_enabled else '–' }}**{{ ' 🔗' if s.name is match('pc:\d+$') else '' }}{{ ' ⏳' if s.pending | default(false) else '' }} | {{ s['*end_time'] if s.end_enabled else '–' }} | {{ s['*days'] }} | {{ (('Once, ran' if s.ran | default(false) else 'Once') if s.one_time else 'Weekly') }} | {{ '✅' if s.enabled else '⏸️' }} | {{ loc(s) }} |
         {% endfor %}
         {% if ch | selectattr('name', 'match', 'pc:\d+$') | list | count > 0 %}<small>🔗 = linked to a preconditioning schedule</small>
         {% endif %}{% endif %}

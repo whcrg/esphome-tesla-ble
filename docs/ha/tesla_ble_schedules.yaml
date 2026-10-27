@@ -38,6 +38,7 @@
 # =====================================================================================================
 
 template:
+  # The car keeps one-time schedules listed after they have run; sensor.tesla_schedule_queue marks those `ran`.
   - triggers:
       - trigger: event
         event_type: esphome.tesla_schedules_updated
@@ -64,6 +65,8 @@ template:
   # Charge requests of precondition schedules: {"<schedule id>": {start, end, target, seen}}, start/end "HH:MM".
   # Set and cleared by `tesla_ble_departure_changed`; a request whose schedule has not been in the car's list
   # for 7 days is dropped (the schedule was deleted elsewhere). Kept across Home Assistant restarts.
+  # `saved_at` ({"<schedule id>": ISO time}) records when each precondition schedule was last saved from Home
+  # Assistant: a one-time schedule runs at the first ready time after that (or after its creation).
   - triggers:
       - trigger: event
         event_type: tesla_ble_departure_changed
@@ -94,6 +97,18 @@ template:
               {%- endfor -%}
             {%- endif -%}
             {{- ns.d -}}
+          saved_at: >-
+            {%- set old = state_attr('sensor.tesla_charge_requests', 'saved_at') -%}
+            {%- set old = old if old is mapping else {} -%}
+            {%- set ns = namespace(d={}) -%}
+            {%- set pre = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
+            {%- set ids = (pre if pre is list else []) | map(attribute='id') | map('string') | list -%}
+            {%- set sid = (trigger.event.data.schedule_id | string) if trigger.platform == 'event' else '' -%}
+            {%- for k, v in old.items() if k != sid and (k in ids or (v | as_datetime(now())) > now() - timedelta(days=7)) -%}
+              {%- set ns.d = dict(ns.d, **{k: v}) -%}{%- endfor -%}
+            {%- if trigger.platform == 'event' and trigger.event.data.change == 'saved' -%}
+              {%- set ns.d = dict(ns.d, **{sid: now().isoformat()}) -%}{%- endif -%}
+            {{- ns.d -}}
     sensor:
       - name: Tesla charge requests
         unique_id: tesla_charge_requests
@@ -101,6 +116,7 @@ template:
         state: "{{ requests | count }}"
         attributes:
           requests: "{{ requests }}"
+          saved_at: "{{ saved_at }}"
 
   # Changes waiting for the car: saves and deletes made while it was out of reach. `pending` is a list of
   # {kind, op, schedule_id, payload, queued_at}; payload is the ESPHome action data. A newer change to the same
@@ -114,6 +130,7 @@ template:
         entity_id:
           - sensor.tesla_precondition_schedules
           - sensor.tesla_charge_schedules
+          - sensor.tesla_charge_requests
       - trigger: time_pattern
         minutes: "/15"
       - trigger: homeassistant
@@ -147,7 +164,7 @@ template:
                 {%- endif -%}
               {%- endif -%}
             {%- endif -%}
-            {#- drop saves of one-time schedules whose (only) run has passed -#}
+            {#- drop saves of one-time schedules whose run (the first one after the save) has passed -#}
             {%- set out = namespace(l=[]) -%}
             {%- for i in ns.l -%}
               {%- set p = i.payload -%}
@@ -155,9 +172,9 @@ template:
               {%- if i.op == 'set' and p.one_time | default(false) -%}
                 {%- set t = p.precondition_time if i.kind == 'precondition'
                             else (p.end_time if p.end_enabled | default(true) else p.start_time) -%}
-                {%- set created = as_local(as_datetime(i.schedule_id | int)) -%}
-                {%- set r = created.replace(hour=(t // 60) % 24, minute=t % 60, second=0, microsecond=0) -%}
-                {%- set r = r + timedelta(days=1) if r <= created else r -%}
+                {%- set saved = as_local(i.queued_at | as_datetime) -%}
+                {%- set r = saved.replace(hour=(t // 60) % 24, minute=t % 60, second=0, microsecond=0) -%}
+                {%- set r = r + timedelta(days=1) if r <= saved else r -%}
                 {%- set past = r < now() -%}
               {%- endif -%}
               {%- if not past -%}{%- set out.l = out.l + [i] -%}{%- endif -%}
@@ -177,12 +194,28 @@ template:
             {%- for kind, car in [('precondition', car_pre), ('charge', car_ch)] -%}
               {%- set q = pending | selectattr('kind', 'eq', kind) | list -%}
               {%- set qids = q | map(attribute='schedule_id') | map('int') | list -%}
-              {%- set ns = namespace(l=car | rejectattr('id', 'in', qids) | list) -%}
+              {#- `ran`: a one-time schedule that has already run: its first ready time after it was created or last
+                  saved from Home Assistant has passed (edits made in the Tesla app are not seen) -#}
+              {%- set saved = state_attr('sensor.tesla_charge_requests', 'saved_at') -%}
+              {%- set saved = saved if saved is mapping and kind == 'precondition' else {} -%}
+              {%- set ns = namespace(l=[]) -%}
+              {%- for s in car | rejectattr('id', 'in', qids) -%}
+                {%- set ran = false -%}
+                {%- if s.one_time -%}
+                  {%- set t = s.precondition_time if kind == 'precondition' else (s.end_time if s.end_enabled else s.start_time) -%}
+                  {%- set base = as_local(as_datetime(s.id)) if s.id >= 1600000000 else now() -%}
+                  {%- set sv = saved.get(s.id | string) | as_datetime(none) -%}
+                  {%- if sv -%}{%- set base = [base, as_local(sv)] | max -%}{%- endif -%}
+                  {%- set r = base.replace(hour=(t // 60) % 24, minute=t % 60, second=0, microsecond=0) -%}
+                  {%- set ran = (r + timedelta(days=1) if r <= base else r) < now() -%}
+                {%- endif -%}
+                {%- set ns.l = ns.l + [dict(s, ran=ran)] -%}
+              {%- endfor -%}
               {%- for i in q if i.op == 'set' -%}
                 {%- set p = i.payload -%}
                 {%- set e = {'id': i.schedule_id | int, 'name': p.name | default(''), 'days': p.days_of_week,
                              '*days': days(p.days_of_week), 'one_time': p.one_time, 'enabled': p.enabled,
-                             'latitude': p.latitude, 'longitude': p.longitude, 'pending': true} -%}
+                             'latitude': p.latitude, 'longitude': p.longitude, 'pending': true, 'ran': false} -%}
                 {%- if kind == 'precondition' -%}
                   {%- set e = dict(e, precondition_time=p.precondition_time, **{'*precondition_time': hhmm(p.precondition_time)}) -%}
                 {%- else -%}
@@ -227,13 +260,19 @@ template:
             {%- set n = now() -%}
             {%- set horizon = n + timedelta(hours=72) -%}
             {%- set out = namespace(l=[]) -%}
-            {%- for s in pre if s.enabled -%}
+            {%- for s in pre if s.enabled and not s.ran | default(false) -%}
               {%- set hh = (s.precondition_time // 60) % 24 -%}{%- set mm = s.precondition_time % 60 -%}
               {%- set runs = namespace(l=[]) -%}
               {%- if s.one_time -%}
+                {#- first run after creation; a one-time schedule that has not run but whose time has passed
+                    (edited, or queued) runs at the next occurrence -#}
                 {%- set created = as_local(as_datetime(s.id)) if s.id >= 1600000000 else n -%}
                 {%- set r = created.replace(hour=hh, minute=mm, second=0, microsecond=0) -%}
                 {%- set r = r + timedelta(days=1) if r <= created else r -%}
+                {%- if r <= n and s.ran is defined -%}
+                  {%- set r = n.replace(hour=hh, minute=mm, second=0, microsecond=0) -%}
+                  {%- set r = r + timedelta(days=1) if r <= n else r -%}
+                {%- endif -%}
                 {%- set runs.l = [r] -%}
               {%- else -%}
                 {%- for d in range(0, 4) -%}
@@ -402,10 +441,12 @@ script:
         then:
           - stop: Car out of BLE range
             response_variable: result
-      - if:
-          - condition: state
-            entity_id: binary_sensor.tesla_ble_asleep
-            state: "on"
+      - if:   # asleep, or not known yet (just back in range)
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: binary_sensor.tesla_ble_asleep
+                state: "off"
         then:
           - action: button.press
             target:
@@ -1111,12 +1152,12 @@ automation:
             {%- set ns = namespace(o=['➕ New precondition schedule', '➕ New charge schedule']) -%}
             {%- for s in pre | sort(attribute='precondition_time') -%}
             {%- set ns.o = ns.o + ['🌡️ ' ~ s['*precondition_time'] ~ ' · ' ~ s['*days'] ~ ' · '
-                 ~ ('Once' if s.one_time else 'Weekly') ~ ('' if s.enabled else ' · paused') ~ charge(s) ~ where(s) ~ (' · ⏳' if s.pending | default(false) else '') ~ ' · #' ~ s.id] -%}
+                 ~ (('Once, ran' if s.ran | default(false) else 'Once') if s.one_time else 'Weekly') ~ ('' if s.enabled else ' · paused') ~ charge(s) ~ where(s) ~ (' · ⏳' if s.pending | default(false) else '') ~ ' · #' ~ s.id] -%}
             {%- endfor -%}
             {%- for s in ch | rejectattr('name', 'match', 'pc:\\d+$') | sort(attribute='start_time') -%}
             {%- set ns.o = ns.o + ['🔌 ' ~ ((s['*start_time'] ~ '–' ~ s['*end_time']) if s.start_enabled and s.end_enabled
                  else ('from ' ~ s['*start_time']) if s.start_enabled else ('until ' ~ s['*end_time'])) ~ ' · ' ~ s['*days'] ~ ' · '
-                 ~ ('Once' if s.one_time else 'Weekly') ~ ('' if s.enabled else ' · paused') ~ where(s) ~ (' · ⏳' if s.pending | default(false) else '') ~ ' · #' ~ s.id] -%}
+                 ~ (('Once, ran' if s.ran | default(false) else 'Once') if s.one_time else 'Weekly') ~ ('' if s.enabled else ' · paused') ~ where(s) ~ (' · ⏳' if s.pending | default(false) else '') ~ ' · #' ~ s.id] -%}
             {%- endfor -%}
             {{- ns.o -}}
       - action: input_select.set_options
@@ -1165,7 +1206,7 @@ automation:
       - variables:
           t1: "{{ (s.precondition_time if kind == 'precondition' else s.start_time) | int(0) }}"
           rq: >-
-            {{- (state_attr('sensor.tesla_charge_requests', 'requests') or {}).get(sid)
+            {{- (state_attr('sensor.tesla_charge_requests', 'requests') or {}).get(sid | string)
                 if kind == 'precondition' and sid != '' else none -}}
       - variables:
           also_charge: "{{ rq is not none }}"

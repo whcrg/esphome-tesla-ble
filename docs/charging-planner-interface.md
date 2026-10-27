@@ -44,7 +44,7 @@ A trigger-based template sensor. It updates when the car's precondition list cha
 
 **Guarantees:**
 - Disabled schedules are left out.
-- A **one-time** schedule appears only for its single run: the first ready time after it was created. The car keeps one-time schedules listed after they have run; the sensor drops them once that run is past. A planner should not parse one-time schedules itself.
+- A **one-time** schedule appears only for its single run: the first ready time after it was created or last saved from Home Assistant. The car keeps one-time schedules listed (and enabled) after they have run; the sensor drops them once that run is past. A planner should not parse one-time schedules itself.
 - A **weekly** schedule appears for each matching day in the window (today and the next three days, cut at 72 h).
 - `charge_start` ≤ `charge_end` ≤ `at`; a window crossing midnight is resolved to the right dates.
 - Schedules the car reported, with changes still queued for the car applied (`pending: true`): the car's part is as fresh as `sensor.tesla_precondition_schedules` → `read_at` (below). A queued delete already removes the departure.
