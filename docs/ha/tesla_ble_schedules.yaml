@@ -66,13 +66,19 @@ template:
   # Charge requests of precondition schedules: {"<schedule id>": {start, end, target, seen}}, start/end "HH:MM".
   # Set and cleared by `tesla_ble_departure_changed`; a request whose schedule has not been in the car's list
   # for 7 days is dropped (the schedule was deleted elsewhere). Kept across Home Assistant restarts.
-  # `saved_at` ({"<schedule id>": ISO time}) records when each precondition schedule was last saved from Home
-  # Assistant: a one-time schedule runs at the first ready time after that (or after its creation).
+  # `saved_at` ({"precondition:<id>" or "charge:<id>": ISO time}) records when each schedule was last saved, which
+  # is when a one-time schedule is set up again: from the package's set scripts, from the event
+  # `tesla_ble_schedule_saved` (data: kind, schedule_id; for automations that write to the car directly), and
+  # from any read in which a schedule's settings differ from the previous read (the Tesla app, the car's screen).
   - triggers:
       - trigger: event
-        event_type: tesla_ble_departure_changed
+        event_type:
+          - tesla_ble_departure_changed
+          - tesla_ble_schedule_saved
       - trigger: state
-        entity_id: sensor.tesla_precondition_schedules
+        entity_id:
+          - sensor.tesla_precondition_schedules
+          - sensor.tesla_charge_schedules
     actions:
       - variables:
           requests: >-
@@ -80,7 +86,9 @@ template:
             {%- set old = state_attr('sensor.tesla_charge_requests', 'requests') -%}
             {%- set old = old if old is mapping else {} -%}
             {%- set ns = namespace(d={}) -%}
-            {%- if trigger.platform == 'event' -%}
+            {%- if trigger.platform == 'event' and trigger.event.event_type == 'tesla_ble_schedule_saved' -%}
+              {%- set ns.d = old -%}
+            {%- elif trigger.platform == 'event' -%}
               {%- set sid = trigger.event.data.schedule_id | string -%}
               {%- for k, v in old.items() if k != sid -%}{%- set ns.d = dict(ns.d, **{k: v}) -%}{%- endfor -%}
               {%- set e = trigger.event.data -%}
@@ -101,14 +109,32 @@ template:
           saved_at: >-
             {%- set old = state_attr('sensor.tesla_charge_requests', 'saved_at') -%}
             {%- set old = old if old is mapping else {} -%}
-            {%- set ns = namespace(d={}) -%}
-            {%- set pre = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
-            {%- set ids = (pre if pre is list else []) | map(attribute='id') | map('string') | list -%}
-            {%- set sid = (trigger.event.data.schedule_id | string) if trigger.platform == 'event' else '' -%}
-            {%- for k, v in old.items() if k != sid and (k in ids or (v | as_datetime(now())) > now() - timedelta(days=7)) -%}
+            {%- set ids = namespace(l=[]) -%}
+            {%- for kind in ['precondition', 'charge'] -%}
+              {%- set l = state_attr('sensor.tesla_' ~ kind ~ '_schedules', 'schedules') -%}
+              {%- for s in (l if l is list else []) -%}{%- set ids.l = ids.l + [kind ~ ':' ~ s.id] -%}{%- endfor -%}
+            {%- endfor -%}
+            {%- set ns = namespace(d={}, now=[], key='') -%}
+            {%- if trigger.platform == 'event' -%}
+              {%- set e = trigger.event.data -%}
+              {%- set ns.key = (e.kind | default('precondition')) ~ ':' ~ e.schedule_id -%}
+              {%- if e.change | default('saved') == 'saved' -%}{%- set ns.now = [ns.key] -%}{%- endif -%}
+            {%- else -%}
+              {#- a list was read: schedules whose settings differ from the previous read were changed elsewhere -#}
+              {%- set kind = 'charge' if trigger.entity_id == 'sensor.tesla_charge_schedules' else 'precondition' -%}
+              {%- set before = trigger.from_state.attributes.schedules if trigger.from_state else none -%}
+              {%- set after = trigger.to_state.attributes.schedules if trigger.to_state else none -%}
+              {%- if before is list and after is list -%}
+                {%- for s in after -%}
+                  {%- set p = before | selectattr('id', 'eq', s.id) | list -%}
+                  {%- if p and p[0] != s -%}{%- set ns.now = ns.now + [kind ~ ':' ~ s.id] -%}{%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+            {%- endif -%}
+            {%- for k, v in old.items() if k != ns.key and k not in ns.now
+                and (k in ids.l or (v | as_datetime(now())) > now() - timedelta(days=7)) -%}
               {%- set ns.d = dict(ns.d, **{k: v}) -%}{%- endfor -%}
-            {%- if trigger.platform == 'event' and trigger.event.data.change == 'saved' -%}
-              {%- set ns.d = dict(ns.d, **{sid: now().isoformat()}) -%}{%- endif -%}
+            {%- for k in ns.now -%}{%- set ns.d = dict(ns.d, **{k: now().isoformat()}) -%}{%- endfor -%}
             {{- ns.d -}}
     sensor:
       - name: Tesla charge requests
@@ -166,6 +192,15 @@ template:
               {%- endif -%}
             {%- endif -%}
             {#- drop saves of one-time schedules whose run (the first one after the save) has passed -#}
+            {%- macro next_run(base, t, days) -%}
+              {#- first ready time t (minutes) after base on one of the days (bitmask; 0 = any day) -#}
+              {%- set nr = namespace(r=none) -%}
+              {%- for i in range(0, 8) -%}
+                {%- set c = (base + timedelta(days=i)).replace(hour=(t // 60) % 24, minute=t % 60, second=0, microsecond=0) -%}
+                {%- if nr.r is none and c > base and (days == 0 or (days // (2 ** ((c.weekday() + 1) % 7))) % 2 == 1) -%}
+                  {%- set nr.r = c -%}{%- endif -%}
+              {%- endfor -%}{{- nr.r.isoformat() if nr.r else '' -}}
+            {%- endmacro -%}
             {%- set out = namespace(l=[]) -%}
             {%- for i in ns.l -%}
               {%- set p = i.payload -%}
@@ -173,10 +208,8 @@ template:
               {%- if i.op == 'set' and p.one_time | default(false) -%}
                 {%- set t = p.precondition_time if i.kind == 'precondition'
                             else (p.end_time if p.end_enabled | default(true) else p.start_time) -%}
-                {%- set saved = as_local(i.queued_at | as_datetime) -%}
-                {%- set r = saved.replace(hour=(t // 60) % 24, minute=t % 60, second=0, microsecond=0) -%}
-                {%- set r = r + timedelta(days=1) if r <= saved else r -%}
-                {%- set past = r < now() -%}
+                {%- set r = next_run(as_local(i.queued_at | as_datetime), t, p.days_of_week | default(0)) | as_datetime(none) -%}
+                {%- set past = r is not none and r < now() -%}
               {%- endif -%}
               {%- if not past -%}{%- set out.l = out.l + [i] -%}{%- endif -%}
             {%- endfor -%}
@@ -191,34 +224,46 @@ template:
               {%- endfor -%}{{- n.l | join(', ') -}}
             {%- endmacro -%}
             {%- macro hhmm(t) -%}{{- '%02d:%02d' % ((t // 60) % 24, t % 60) -}}{%- endmacro -%}
+            {%- macro next_run(base, t, days) -%}
+              {#- first ready time t (minutes) after base on one of the days (bitmask; 0 = any day) -#}
+              {%- set nr = namespace(r=none) -%}
+              {%- for i in range(0, 8) -%}
+                {%- set c = (base + timedelta(days=i)).replace(hour=(t // 60) % 24, minute=t % 60, second=0, microsecond=0) -%}
+                {%- if nr.r is none and c > base and (days == 0 or (days // (2 ** ((c.weekday() + 1) % 7))) % 2 == 1) -%}
+                  {%- set nr.r = c -%}{%- endif -%}
+              {%- endfor -%}{{- nr.r.isoformat() if nr.r else '' -}}
+            {%- endmacro -%}
+            {%- set saved = state_attr('sensor.tesla_charge_requests', 'saved_at') -%}
+            {%- set saved = saved if saved is mapping else {} -%}
             {%- set out = namespace(pre=[], ch=[]) -%}
             {%- for kind, car in [('precondition', car_pre), ('charge', car_ch)] -%}
               {%- set q = pending | selectattr('kind', 'eq', kind) | list -%}
               {%- set qids = q | map(attribute='schedule_id') | map('int') | list -%}
-              {#- `ran`: a one-time schedule that has already run: its first ready time after it was created or last
-                  saved from Home Assistant has passed (edits made in the Tesla app are not seen) -#}
-              {%- set saved = state_attr('sensor.tesla_charge_requests', 'saved_at') -%}
-              {%- set saved = saved if saved is mapping and kind == 'precondition' else {} -%}
+              {#- One-time schedules: `run_at` is their single run, the first ready time on one of their days after
+                  they were created or last saved (sensor.tesla_charge_requests saved_at); `ran` once it has passed.
+                  The car keeps them listed after they run. -#}
               {%- set ns = namespace(l=[]) -%}
               {%- for s in car | rejectattr('id', 'in', qids) -%}
                 {%- set run = none -%}
                 {%- if s.one_time -%}
                   {%- set t = s.precondition_time if kind == 'precondition' else (s.end_time if s.end_enabled else s.start_time) -%}
                   {%- set base = as_local(as_datetime(s.id)) if s.id >= 1600000000 else now() -%}
-                  {%- set sv = saved.get(s.id | string) | as_datetime(none) -%}
+                  {%- set sv = saved.get(kind ~ ':' ~ s.id) | as_datetime(none) -%}
                   {%- if sv -%}{%- set base = [base, as_local(sv)] | max -%}{%- endif -%}
-                  {%- set r = base.replace(hour=(t // 60) % 24, minute=t % 60, second=0, microsecond=0) -%}
-                  {%- set run = r + timedelta(days=1) if r <= base else r -%}
+                  {%- set run = next_run(base, t, s.days) | as_datetime(none) -%}
                 {%- endif -%}
                 {%- set ran = run is not none and run < now() -%}
-                {#- ran_at: when it ran (used by the one-time cleanup) -#}
-                {%- set ns.l = ns.l + [dict(s, ran=ran, ran_at=run.isoformat() if ran else none)] -%}
+                {%- set ns.l = ns.l + [dict(s, ran=ran, run_at=run.isoformat() if run else none)] -%}
               {%- endfor -%}
               {%- for i in q if i.op == 'set' -%}
                 {%- set p = i.payload -%}
                 {%- set e = {'id': i.schedule_id | int, 'name': p.name | default(''), 'days': p.days_of_week,
                              '*days': days(p.days_of_week), 'one_time': p.one_time, 'enabled': p.enabled,
                              'latitude': p.latitude, 'longitude': p.longitude, 'pending': true, 'ran': false} -%}
+                {%- if p.one_time -%}
+                  {%- set t = p.precondition_time if kind == 'precondition' else (p.end_time if p.end_enabled else p.start_time) -%}
+                  {%- set e = dict(e, run_at=next_run(as_local(i.queued_at | as_datetime), t, p.days_of_week) or none) -%}
+                {%- endif -%}
                 {%- if kind == 'precondition' -%}
                   {%- set e = dict(e, precondition_time=p.precondition_time, **{'*precondition_time': hhmm(p.precondition_time)}) -%}
                 {%- else -%}
@@ -240,7 +285,7 @@ template:
           precondition_schedules: "{{ merged.precondition }}"
           charge_schedules: "{{ merged.charge }}"
 
-  # Next departures resolved from the precondition schedules (one-time schedules by their creation time).
+  # Next departures resolved from the precondition schedules (the merged lists of sensor.tesla_schedule_queue).
   - triggers:
       - trigger: state
         entity_id:
@@ -267,16 +312,9 @@ template:
               {%- set hh = (s.precondition_time // 60) % 24 -%}{%- set mm = s.precondition_time % 60 -%}
               {%- set runs = namespace(l=[]) -%}
               {%- if s.one_time -%}
-                {#- first run after creation; a one-time schedule that has not run but whose time has passed
-                    (edited, or queued) runs at the next occurrence -#}
-                {%- set created = as_local(as_datetime(s.id)) if s.id >= 1600000000 else n -%}
-                {%- set r = created.replace(hour=hh, minute=mm, second=0, microsecond=0) -%}
-                {%- set r = r + timedelta(days=1) if r <= created else r -%}
-                {%- if r <= n and s.ran is defined -%}
-                  {%- set r = n.replace(hour=hh, minute=mm, second=0, microsecond=0) -%}
-                  {%- set r = r + timedelta(days=1) if r <= n else r -%}
-                {%- endif -%}
-                {%- set runs.l = [r] -%}
+                {#- its single run, worked out by sensor.tesla_schedule_queue -#}
+                {%- set r = s.run_at | default(none) | as_datetime(none) -%}
+                {%- set runs.l = [as_local(r)] if r else [] -%}
               {%- else -%}
                 {%- for d in range(0, 4) -%}
                   {%- set r = n.replace(hour=hh, minute=mm, second=0, microsecond=0) + timedelta(days=d) -%}
@@ -726,6 +764,8 @@ script:
         else:
           - event: tesla_ble_schedule_queue
             event_data: { action: add, kind: charge, op: set, schedule_id: "{{ sid }}", payload: "{{ payload }}" }
+      - event: tesla_ble_schedule_saved   # a one-time schedule is set up again from now
+        event_data: { kind: charge, schedule_id: "{{ sid }}" }
 
   tesla_delete_schedule:
     alias: Tesla - delete schedule
@@ -1013,7 +1053,7 @@ automation:
             {%- for kind, attr in [('precondition', 'precondition_schedules'), ('charge', 'charge_schedules')] -%}
               {%- for s in state_attr('sensor.tesla_schedule_queue', attr) or []
                   if s.ran | default(false) and not s.name | default('') is match('pc:\\d+$')
-                     and (s.ran_at | as_datetime(now())) < now() - timedelta(minutes=15) -%}
+                     and (s.run_at | as_datetime(now())) < now() - timedelta(minutes=15) -%}
                 {%- set ns.l = ns.l + [{'kind': kind, 'schedule_id': s.id | string}] -%}
               {%- endfor -%}
             {%- endfor -%}
