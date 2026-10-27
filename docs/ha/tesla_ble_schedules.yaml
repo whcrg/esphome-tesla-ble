@@ -620,10 +620,27 @@ script:
           lat: "{{ latitude if latitude is defined and latitude is number else state_attr(zone, 'latitude') }}"
           lon: "{{ longitude if longitude is defined and longitude is number else state_attr(zone, 'longitude') }}"
       - variables:
+          kind: precondition
+      - variables: &moved_vars
+          # The car keeps a schedule's location when it is edited, so a schedule moved elsewhere is replaced:
+          # the old one is deleted and a new one added, which takes over its charge request.
+          moved_from: >-
+            {%- set l = state_attr('sensor.tesla_schedule_queue', kind ~ '_schedules') -%}
+            {%- set e = (l if l is list else []) | selectattr('id', 'eq', schedule_id | default('') | int(0)) | list -%}
+            {{- e[0].id if e and distance(e[0].latitude, e[0].longitude, lat | float, lon | float) > 0.05 else 0 -}}
+      - &delete_moved
+        if:
+          - "{{ moved_from | int(0) > 0 }}"
+        then:
+          - action: script.tesla_delete_schedule
+            data: { kind: "{{ kind }}", schedule_id: "{{ moved_from }}" }
+      - variables:
           # New schedules get their ID here (the creation time, like the car's own IDs), so the request and
           # the departure event can name it.
-          sid: "{{ schedule_id if schedule_id | default('') | string != '' else (as_timestamp(now()) | int) | string }}"
-          old_req: "{{ (state_attr('sensor.tesla_charge_requests', 'requests') or {}).get(sid | string) }}"
+          sid: &new_sid >-
+            {{ schedule_id if schedule_id | default('') | string != '' and moved_from | int(0) == 0
+               else (as_timestamp(now()) | int) | string }}
+          old_req: "{{ (state_attr('sensor.tesla_charge_requests', 'requests') or {}).get(schedule_id | default('') | string) }}"
       - variables:
           req: >-
             {%- if charge is not defined -%}{{ old_req -}}
@@ -738,8 +755,12 @@ script:
     sequence:
       - variables: *schedule_common_vars
       - variables:
+          kind: charge
+      - variables: *moved_vars
+      - *delete_moved
+      - variables:
           # New schedules get their ID here (the creation time), so a queued one can be edited before upload
-          sid: "{{ schedule_id if schedule_id | default('') | string != '' else (as_timestamp(now()) | int) | string }}"
+          sid: *new_sid
       - variables:
           payload:
             schedule_id: "{{ sid }}"
