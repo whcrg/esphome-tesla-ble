@@ -41,6 +41,8 @@ A schedule only runs when the car is parked at its location. The Tesla app sets 
 
 The schedule location matters: the car only runs a schedule when it is parked near that latitude/longitude, so use the location where the car will be (eg `zone.home`).
 
+The car keeps a schedule's location when the schedule is edited. So when an edit moves a schedule more than 50 m, the set scripts (and so the editor) delete it and add a new one with a new ID instead; a precondition schedule's charge request moves to the new one. In the editor the selection then goes back to a new schedule; pick the new one from the list.
+
 > [!NOTE]
 > A BLE response is limited to 400 bytes, enough for roughly ten schedules of each type. If you have more, the response cannot be decoded.
 
