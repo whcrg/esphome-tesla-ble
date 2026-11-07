@@ -400,6 +400,14 @@ input_select:
     options:
       - Home
 
+input_text:
+  tesla_schedule_loaded_id:
+    name: Tesla schedule editor loaded ID
+    icon: mdi:identifier
+    # The schedule whose settings are in the editor fields ("" for a new one). Rebuilding the list re-selects
+    # it without reloading the fields, so changes you have not saved yet survive a list refresh.
+    max: 20
+
 input_datetime:
   tesla_schedule_time:
     name: Tesla schedule time   # precondition "ready at" / charge start
@@ -685,6 +693,11 @@ script:
           charge_target: "{{ req.target if req else none }}"
           latitude: "{{ lat | float }}"
           longitude: "{{ lon | float }}"
+      - &return_sid
+        variables:
+          saved: { schedule_id: "{{ sid | string }}" }
+      - stop: Saved
+        response_variable: saved
 
   tesla_set_charge_schedule:
     alias: Tesla - add or edit charge schedule
@@ -787,6 +800,9 @@ script:
             event_data: { action: add, kind: charge, op: set, schedule_id: "{{ sid }}", payload: "{{ payload }}" }
       - event: tesla_ble_schedule_saved   # a one-time schedule is set up again from now
         event_data: { kind: charge, schedule_id: "{{ sid }}" }
+      - *return_sid
+      - stop: Saved
+        response_variable: saved
 
   tesla_delete_schedule:
     alias: Tesla - delete schedule
@@ -850,7 +866,9 @@ script:
     sequence:
       - variables:
           sel: "{{ states('input_select.tesla_schedule_select') }}"
-          sid: "{{ sel.split('#')[-1] if '#' in sel else '' }}"
+          sid: >-
+            {%- set loaded = states('input_text.tesla_schedule_loaded_id') -%}
+            {{- loaded if loaded not in ['', 'unknown', 'unavailable'] else (sel.split('#')[-1] if '#' in sel else '') -}}
           kind: "{{ states('input_select.tesla_schedule_type') }}"
           days: >-
             {%- set ns = namespace(l=[]) -%}
@@ -907,6 +925,15 @@ script:
                       start_enabled=is_state('input_boolean.tesla_schedule_start_enabled', 'on'),
                       end_time=states('input_datetime.tesla_schedule_end'),
                       end_enabled=is_state('input_boolean.tesla_schedule_end_enabled', 'on')) -}}
+            response_variable: saved
+          # The fields now hold this schedule: the list keeps it selected (a new one once the car lists it)
+          # without reloading the fields, and a second save edits it instead of adding another.
+          - &remember_saved
+            action: input_text.set_value
+            target:
+              entity_id: input_text.tesla_schedule_loaded_id
+            data:
+              value: "{{ saved.schedule_id }}"
         else:
           - action: script.tesla_set_precondition_schedule
             data: >-
@@ -915,6 +942,8 @@ script:
                       charge_start=states('input_datetime.tesla_schedule_charge_start'),
                       charge_end=states('input_datetime.tesla_schedule_end'),
                       charge_target=states('input_number.tesla_schedule_charge_target') | float(0) | int) -}}
+            response_variable: saved
+          - *remember_saved
 
   tesla_schedule_editor_delete:
     alias: Tesla schedule editor - delete selected
@@ -1229,7 +1258,8 @@ automation:
     alias: Tesla schedule editor - sync list
     description: >-
       Rebuilds the editor's schedule list when the car's schedules or charge requests change, keeping the
-      selection. Linked charge schedules are left out (edit their precondition schedule).
+      selection (the schedule in the editor fields, also a just-saved new one). Linked charge schedules are
+      left out (edit their precondition schedule).
     mode: queued
     max_exceeded: silent
     triggers:
@@ -1249,7 +1279,9 @@ automation:
     actions:
       - variables:
           sel: "{{ states('input_select.tesla_schedule_select') }}"
-          current_id: "{{ sel.split('#')[-1] if '#' in sel else '' }}"
+          current_id: >-
+            {%- set loaded = states('input_text.tesla_schedule_loaded_id') -%}
+            {{- loaded if loaded not in ['', 'unknown', 'unavailable'] else (sel.split('#')[-1] if '#' in sel else '') -}}
           reqs: >-
             {%- set r = state_attr('sensor.tesla_charge_requests', 'requests') -%}{{ r if r is mapping else {} -}}
           pre: >-
@@ -1301,16 +1333,30 @@ automation:
 
   - id: tesla_schedule_editor_load_selection
     alias: Tesla schedule editor - load selection
-    description: Fills the editor fields with the selected schedule, or with defaults for a new one.
+    description: >-
+      Fills the editor fields with the selected schedule, or with defaults for a new one. A list rebuild that
+      only re-selects the schedule already in the fields leaves them alone, so unsaved changes are kept.
     mode: restart
     triggers:
       - trigger: state
         entity_id: input_select.tesla_schedule_select
         to: ~   # ignore attribute-only changes (option list rebuilds)
     actions:
+      - delay: { milliseconds: 500 }   # a rebuild briefly drops to the first option before re-selecting
       - variables:
-          sel: "{{ trigger.to_state.state }}"
+          sel: "{{ states('input_select.tesla_schedule_select') }}"
           sid: "{{ sel.split('#')[-1] if '#' in sel else '' }}"
+      - if:
+          - "{{ trigger.to_state.context.user_id is none and sid != ''
+                and sid == states('input_text.tesla_schedule_loaded_id') }}"
+        then:
+          - stop: Same schedule re-selected by a list rebuild
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.tesla_schedule_loaded_id
+        data:
+          value: "{{ sid }}"
+      - variables:
           pre: >-
             {%- set p = state_attr('sensor.tesla_schedule_queue', 'precondition_schedules') -%}{%- set p = p if p is list else state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}{{ p if p is list else [] -}}
           ch: >-
