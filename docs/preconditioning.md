@@ -41,6 +41,8 @@ A schedule only runs when the car is parked at its location. The Tesla app sets 
 
 To see a street address instead of the distance, turn on **Show addresses** (`input_boolean.tesla_schedule_addresses`, off by default). The package then looks up each schedule location away from home once from OpenStreetMap's free Nominatim service, at most one a second, and keeps the result in `sensor.tesla_schedule_addresses`. This sends those coordinates to nominatim.openstreetmap.org. It shows a named place or the street and number, then the town, for example *Hämeenkatu 10, Tampere*. Until the lookup is done, or if it finds nothing, the distance is shown.
 
+A schedule within 200 m of the Home or Work location set in the car also gets *(Tesla: home)* or *(Tesla: work)*. The car reports those in its charge state; the ESPHome component publishes them as the **Home location** and **Work location** text sensors (`latitude,longitude`, needs `home_location:` and `work_location:` under `tesla_ble_vehicle:`), and `sensor.tesla_saved_locations` keeps the last known values while the car is out of reach.
+
 The schedule location matters: the car only runs a schedule when it is parked near that latitude/longitude, so use the location where the car will be (eg `zone.home`).
 
 The car keeps a schedule's location when the schedule is edited. So when an edit moves a schedule more than 50 m, the set scripts (and so the editor) delete it and add a new one with a new ID instead; a precondition schedule's charge request moves to the new one. In the editor the selection then goes back to a new schedule; pick the new one from the list.

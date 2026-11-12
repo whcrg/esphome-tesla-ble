@@ -15,7 +15,8 @@
 #     schedule or by an external planner (input_select.tesla_charge_scheduling)
 #   - a schedule editor (helpers + automations) used by docs/ha/tesla_ble_dashboard.yaml
 #   - optional street addresses for schedules away from home, looked up from OpenStreetMap
-#     (input_boolean.tesla_schedule_addresses, off by default)
+#     (input_boolean.tesla_schedule_addresses, off by default), and "(Tesla: home)" / "(Tesla: work)" for
+#     schedules at the Home and Work set in the car (needs the ESP's Home/Work location sensors)
 #
 # Install:
 #   1. configuration.yaml:   homeassistant:
@@ -180,6 +181,34 @@ template:
         state: "{{ addresses | count }}"
         attributes:
           addresses: "{{ addresses }}"
+
+  # Home and Work as set in the car, from the ESP's sensor.tesla_ble_home_location / _work_location ("lat,lon"),
+  # kept while the car is out of reach: attributes `home` and `work` = [latitude, longitude], or none if not set.
+  - triggers:
+      - trigger: state
+        entity_id:
+          - sensor.tesla_ble_home_location
+          - sensor.tesla_ble_work_location
+      - trigger: homeassistant
+        event: start
+    sensor:
+      - name: Tesla saved locations
+        unique_id: tesla_saved_locations
+        icon: mdi:map-marker-star
+        state: >-
+          {%- set ns = namespace(n=0) -%}
+          {%- for k in ['home', 'work'] -%}
+            {%- set v = states('sensor.tesla_ble_' ~ k ~ '_location').split(',') -%}
+            {%- if (v | count == 2 and v[0] | is_number) or this.attributes.get(k) -%}{%- set ns.n = ns.n + 1 -%}{%- endif -%}
+          {%- endfor -%}
+          {{- ns.n -}}
+        attributes:
+          home: >-
+            {%- set v = states('sensor.tesla_ble_home_location').split(',') -%}
+            {{- [v[0] | float, v[1] | float] if v | count == 2 and v[0] | is_number else this.attributes.get('home') -}}
+          work: >-
+            {%- set v = states('sensor.tesla_ble_work_location').split(',') -%}
+            {{- [v[0] | float, v[1] | float] if v | count == 2 and v[0] | is_number else this.attributes.get('work') -}}
 
   # Changes waiting for the car: saves and deletes made while it was out of reach. `pending` is a list of
   # {kind, op, schedule_id, payload, queued_at}; payload is the ESPHome action data. A newer change to the same
@@ -1404,7 +1433,9 @@ automation:
           opts: >-
             {%- macro where(s) -%}
             {%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{%- set adr = (state_attr('sensor.tesla_schedule_addresses', 'addresses') or {}).get('%.4f,%.4f' | format(s.latitude, s.longitude)) if is_state('input_boolean.tesla_schedule_addresses', 'on') else none -%}
-            {%- if dh > [state_attr('zone.home', 'radius') | default(100) / 1000, 0.5] | max -%}{{ ' · ' ~ (adr if adr else ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from home') }}{%- endif -%}
+            {%- set tag = namespace(t='') -%}{%- for k in ['work', 'home'] -%}{%- set v = state_attr('sensor.tesla_saved_locations', k) -%}{%- if v and distance(s.latitude, s.longitude, v[0], v[1]) <= 0.2 -%}{%- set tag.t = 'Tesla: ' ~ k -%}{%- endif -%}{%- endfor -%}
+            {%- if dh > [state_attr('zone.home', 'radius') | default(100) / 1000, 0.5] | max -%}{{ ' · ' ~ (adr if adr else ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from home') ~ ((' (' ~ tag.t ~ ')') if tag.t else '') }}
+            {%- elif tag.t -%}{{ ' · ' ~ tag.t }}{%- endif -%}
             {%- endmacro -%}
             {%- macro charge(s) -%}
             {%- set rq = reqs.get(s.id | string) -%}
@@ -1512,7 +1543,8 @@ automation:
           loc_keep: >-
             {%- if s.latitude is defined and loc_zone == '' -%}
             {%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{%- set adr = (state_attr('sensor.tesla_schedule_addresses', 'addresses') or {}).get('%.4f,%.4f' | format(s.latitude, s.longitude)) if is_state('input_boolean.tesla_schedule_addresses', 'on') else none -%}
-            📍 Keep: {{ adr if adr else ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from home' }}
+            {%- set tag = namespace(t='') -%}{%- for k in ['work', 'home'] -%}{%- set v = state_attr('sensor.tesla_saved_locations', k) -%}{%- if v and distance(s.latitude, s.longitude, v[0], v[1]) <= 0.2 -%}{%- set tag.t = 'Tesla: ' ~ k -%}{%- endif -%}{%- endfor -%}
+            📍 Keep: {{ (adr if adr else ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from home') ~ ((' (' ~ tag.t ~ ')') if tag.t else '') }}
             {%- endif -%}
       - variables:
           loc_options: "{{ zone_names + ([loc_keep] if loc_keep else []) }}"
