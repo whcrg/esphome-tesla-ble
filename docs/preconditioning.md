@@ -37,7 +37,9 @@ There is also a **Get precondition schedules** button and a **Delete a precondit
 
 After a set or delete the list is read back automatically. The list arrives as the event `esphome.tesla_precondition_schedules_updated` with fields `count`, `schedules` (JSON: `{"precondition_schedules": [...]}`), `version` and `comment`. Each schedule has `id`, `name`, `days`, `*days`, `precondition_time`, `*precondition_time` (HH:MM), `one_time`, `enabled`, `latitude`, `longitude`. Fields starting with `*` are derived.
 
-A schedule only runs when the car is parked at its location. The Tesla app sets that to wherever the car is when the schedule is made, and doesn't show it. The example card and editor show it as the name of the matching Home Assistant zone (within the zone's radius, or 500 m for small zones), or as *Other, 47 km from Home*.
+A schedule only runs when the car is parked at its location. The Tesla app sets that to wherever the car is when the schedule is made, and doesn't show it. The example card and editor show it as *Home* (within the Home zone's radius, or 500 m for a small zone), or as the distance from home, for example *47 km from home*.
+
+To see a street address instead of the distance, turn on **Show addresses** (`input_boolean.tesla_schedule_addresses`, off by default). The package then looks up each schedule location away from home once from OpenStreetMap's free Nominatim service, at most one a second, and keeps the result in `sensor.tesla_schedule_addresses`. This sends those coordinates to nominatim.openstreetmap.org. It shows a named place or the street and number, then the town, for example *Hämeenkatu 10, Tampere*. Until the lookup is done, or if it finds nothing, the distance is shown.
 
 The schedule location matters: the car only runs a schedule when it is parked near that latitude/longitude, so use the location where the car will be (eg `zone.home`).
 
@@ -83,7 +85,7 @@ The dashboard subview lets you edit schedules without knowing their IDs:
 
 1. Pick a schedule in the **Schedule** dropdown (entries look like `🌡️ 07:30 · Mon, Tue, Wed, Thu, Fri · Weekly · #1792681416`), or pick **➕ New precondition schedule** / **➕ New charge schedule**.
 2. The fields below fill in with its values: time(s), one time, enabled, a toggle per day and, for a precondition schedule, its charge window (see below).
-3. Pick the **Location**: any of your Home Assistant zones (Home first). A schedule outside every zone also offers **📍 Keep: Other, 47 km from Home**, so editing it doesn't move it.
+3. Pick the **Location**: any of your Home Assistant zones (Home first). A schedule outside every zone also offers **📍 Keep: 47 km from home** (or its address), so editing it doesn't move it.
 4. **Save to car** edits the selected schedule or adds the new one. **Delete selected** removes only the selected schedule, after a confirmation.
 
 How it works: the *sync list* automation rebuilds the dropdown whenever a schedule sensor changes, and keeps the current selection if it still exists. The *load selection* automation copies the picked schedule into the helpers. The schedule ID is the `#…` suffix of the dropdown entry, so there is no separate ID field to get out of step. `input_text.tesla_schedule_loaded_id` remembers which schedule is in the fields: a rebuild that only re-selects it doesn't reload the fields, so changes you haven't saved yet are kept while the car's list is re-read. A new schedule stays selected after saving (once the car lists it), so saving again edits it instead of adding a second one.
