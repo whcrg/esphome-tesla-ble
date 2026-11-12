@@ -17,7 +17,7 @@ cards:
 - type: markdown
   title: Schedules
   content: |-
-    {%- macro loc(s) -%}{%- set z = namespace(best='', d=99999) -%}{%- for zone in states.zone if zone.attributes.latitude is defined -%}{%- set d = distance(s.latitude, s.longitude, zone.entity_id) -%}{%- if d is number and d <= [zone.attributes.radius | default(100) / 1000, 0.5] | max and d < z.d -%}{%- set z.best = zone.name -%}{%- set z.d = d -%}{%- endif -%}{%- endfor -%}{%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{{- z.best if z.best else 'Other, ' ~ ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from Home' -}}{%- endmacro -%}
+    {%- macro loc(s) -%}{%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{%- set adr = (state_attr('sensor.tesla_schedule_addresses', 'addresses') or {}).get('%.4f,%.4f' | format(s.latitude, s.longitude)) if is_state('input_boolean.tesla_schedule_addresses', 'on') else none -%}{{- 'Home' if dh <= [state_attr('zone.home', 'radius') | default(100) / 1000, 0.5] | max else adr if adr else ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from home' -}}{%- endmacro -%}
     {%- macro chg(s, reqs, car_mode) -%}{%- set r = reqs.get(s.id | string) -%}{{- (r.start ~ '–' ~ r.end ~ ((' → ' ~ r.target ~ '%') if r.target else '') ~ (' · car' if car_mode else ' · planner')) if r else '–' -}}{%- endmacro -%}
     {%- set ch = state_attr('sensor.tesla_charge_schedules', 'schedules') -%}
     {%- set pre = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
@@ -119,7 +119,7 @@ cards:
           perform_action: script.tesla_refresh_schedules
     - type: markdown
       content: |-
-        {%- macro loc(s) -%}{%- set z = namespace(best='', d=99999) -%}{%- for zone in states.zone if zone.attributes.latitude is defined -%}{%- set d = distance(s.latitude, s.longitude, zone.entity_id) -%}{%- if d is number and d <= [zone.attributes.radius | default(100) / 1000, 0.5] | max and d < z.d -%}{%- set z.best = zone.name -%}{%- set z.d = d -%}{%- endif -%}{%- endfor -%}{%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{{- z.best if z.best else 'Other, ' ~ ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from Home' -}}{%- endmacro -%}
+        {%- macro loc(s) -%}{%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{%- set adr = (state_attr('sensor.tesla_schedule_addresses', 'addresses') or {}).get('%.4f,%.4f' | format(s.latitude, s.longitude)) if is_state('input_boolean.tesla_schedule_addresses', 'on') else none -%}{{- 'Home' if dh <= [state_attr('zone.home', 'radius') | default(100) / 1000, 0.5] | max else adr if adr else ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from home' -}}{%- endmacro -%}
         {%- macro chg(s, reqs, car_mode) -%}{%- set r = reqs.get(s.id | string) -%}{{- (r.start ~ '–' ~ r.end ~ ((' → ' ~ r.target ~ '%') if r.target else '') ~ (' · car' if car_mode else ' · planner')) if r else '–' -}}{%- endmacro -%}
         {%- set ch = state_attr('sensor.tesla_charge_schedules', 'schedules') -%}
         {%- set pre = state_attr('sensor.tesla_precondition_schedules', 'schedules') -%}
@@ -379,3 +379,5 @@ cards:
         name: Charge scheduling
       - entity: input_select.tesla_one_time_cleanup
         name: One-time schedules after they run
+      - entity: input_boolean.tesla_schedule_addresses
+        name: Show addresses (OpenStreetMap lookup)

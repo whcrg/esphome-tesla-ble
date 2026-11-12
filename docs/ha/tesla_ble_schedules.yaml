@@ -14,6 +14,8 @@
 #   - "also charge for this departure" on precondition schedules, handled either by a linked car charge
 #     schedule or by an external planner (input_select.tesla_charge_scheduling)
 #   - a schedule editor (helpers + automations) used by docs/ha/tesla_ble_dashboard.yaml
+#   - optional street addresses for schedules away from home, looked up from OpenStreetMap
+#     (input_boolean.tesla_schedule_addresses, off by default)
 #
 # Install:
 #   1. configuration.yaml:   homeassistant:
@@ -144,6 +146,40 @@ template:
         attributes:
           requests: "{{ requests }}"
           saved_at: "{{ saved_at }}"
+
+  # Street addresses of schedule locations away from home: {"<lat>,<lon>" (4 decimals): "Street 1, Town"}, filled by
+  # the "look up addresses" automation (opt in: input_boolean.tesla_schedule_addresses). "" = nothing found there.
+  # Locations no schedule uses any more are dropped. Kept across Home Assistant restarts.
+  - triggers:
+      - trigger: event
+        event_type: tesla_ble_schedule_address
+      - trigger: state
+        entity_id: sensor.tesla_schedule_queue
+    actions:
+      - variables:
+          addresses: >-
+            {%- set old = state_attr('sensor.tesla_schedule_addresses', 'addresses') -%}
+            {%- set old = old if old is mapping else {} -%}
+            {%- set ns = namespace(d={}, keys=[], lists=0) -%}
+            {%- for kind in ['precondition', 'charge'] -%}
+              {%- set l = state_attr('sensor.tesla_schedule_queue', kind ~ '_schedules') -%}
+              {%- if l is list -%}{%- set ns.lists = ns.lists + 1 -%}{%- endif -%}
+              {%- for s in (l if l is list else []) if s.latitude is defined -%}
+                {%- set ns.keys = ns.keys + ['%.4f,%.4f' | format(s.latitude, s.longitude)] -%}
+              {%- endfor -%}
+            {%- endfor -%}
+            {%- for k, v in old.items() if k in ns.keys or ns.lists == 0 -%}{%- set ns.d = dict(ns.d, **{k: v}) -%}{%- endfor -%}
+            {%- if trigger.platform == 'event' -%}
+              {%- set ns.d = dict(ns.d, **{trigger.event.data.key: trigger.event.data.address}) -%}
+            {%- endif -%}
+            {{- ns.d -}}
+    sensor:
+      - name: Tesla schedule addresses
+        unique_id: tesla_schedule_addresses
+        icon: mdi:map-marker-radius
+        state: "{{ addresses | count }}"
+        attributes:
+          addresses: "{{ addresses }}"
 
   # Changes waiting for the car: saves and deletes made while it was out of reach. `pending` is a list of
   # {kind, op, schedule_id, payload, queued_at}; payload is the ESPHome action data. A newer change to the same
@@ -423,6 +459,9 @@ input_datetime:
     icon: mdi:clock-start
 
 input_boolean:
+  # Look up the street address of schedules away from home from OpenStreetMap (nominatim.openstreetmap.org;
+  # sends those schedules' coordinates there, once per location). Off: they show as "12 km from home".
+  tesla_schedule_addresses: { name: Tesla schedule addresses, icon: mdi:map-search }
   tesla_schedule_start_enabled: { name: Tesla schedule use start, icon: mdi:clock-start }
   tesla_schedule_end_enabled: { name: Tesla schedule use end, icon: mdi:clock-end }
   tesla_schedule_one_time: { name: Tesla schedule one time, icon: mdi:numeric-1-circle }
@@ -444,6 +483,16 @@ input_number:
     step: 1
     unit_of_measurement: "%"
     icon: mdi:battery-charging-80
+
+# Reverse geocoding for input_boolean.tesla_schedule_addresses (OpenStreetMap Nominatim, no key needed; its usage
+# policy asks for a descriptive User-Agent and at most one request a second).
+rest_command:
+  tesla_reverse_geocode:
+    url: "https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat={{ lat }}&lon={{ lon }}"
+    method: GET
+    headers:
+      User-Agent: "Home Assistant tesla-ble schedules package (github.com/PedroKTFC/esphome-tesla-ble)"
+    timeout: 20
 
 # ------------------------------------------------------------------------------------------- scripts
 script:
@@ -1254,6 +1303,70 @@ automation:
         data:
           value: "{{ target }}"
 
+  - id: tesla_schedule_address_lookup
+    alias: Tesla schedules - look up addresses
+    description: >-
+      With "Tesla schedule addresses" on, looks up the street address of each schedule location away from home
+      from OpenStreetMap, once per location and at most one a second, for the card and the editor.
+    mode: queued
+    max: 2
+    max_exceeded: silent
+    triggers:
+      - trigger: state
+        entity_id: sensor.tesla_schedule_queue
+      - trigger: state
+        entity_id: input_boolean.tesla_schedule_addresses
+        to: "on"
+      - trigger: homeassistant
+        event: start
+    conditions:
+      - condition: state
+        entity_id: input_boolean.tesla_schedule_addresses
+        state: "on"
+    actions:
+      - variables:
+          missing: >-
+            {%- set known = state_attr('sensor.tesla_schedule_addresses', 'addresses') -%}
+            {%- set known = known if known is mapping else {} -%}
+            {%- set ns = namespace(l=[]) -%}
+            {%- for kind in ['precondition', 'charge'] -%}
+              {%- set l = state_attr('sensor.tesla_schedule_queue', kind ~ '_schedules') -%}
+              {%- for s in (l if l is list else []) if s.latitude is defined
+                  and distance(s.latitude, s.longitude, 'zone.home') > [state_attr('zone.home', 'radius') | default(100) / 1000, 0.5] | max -%}
+                {%- set k = '%.4f,%.4f' | format(s.latitude, s.longitude) -%}
+                {%- if k not in known and k not in ns.l -%}{%- set ns.l = ns.l + [k] -%}{%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+            {{- ns.l[:10] -}}
+      - repeat:
+          for_each: "{{ missing }}"
+          sequence:
+            - variables:
+                geo: ~
+            - action: rest_command.tesla_reverse_geocode
+              data:
+                lat: "{{ repeat.item.split(',')[0] }}"
+                lon: "{{ repeat.item.split(',')[1] }}"
+              response_variable: geo
+              continue_on_error: true   # network trouble: try again on the next change
+            - if:
+                - "{{ geo is mapping and geo.status | default(0) == 200 and geo.content is mapping }}"
+              then:
+                - event: tesla_ble_schedule_address
+                  event_data:
+                    key: "{{ repeat.item }}"
+                    # A named place (shop, workplace) or street and number, then the town; "" if nothing is there
+                    address: >-
+                      {%- set c = geo.content -%}
+                      {%- set a = c.address | default({}) -%}
+                      {%- set street = a.road | default(a.pedestrian | default(a.footway | default(''))) -%}
+                      {%- set town = a.city | default(a.town | default(a.village | default(a.hamlet | default(a.municipality | default(''))))) -%}
+                      {%- set first = c.name if c.name | default('') else
+                          (street ~ ((' ' ~ a.house_number) if street and a.house_number is defined else '')) -%}
+                      {%- set adr = [first, town] | select | join(', ') -%}
+                      {{- adr if adr else (c.display_name | default('')).split(', ')[:2] | join(', ') -}}
+            - delay: { milliseconds: 1100 }   # Nominatim usage policy: at most one request a second
+
   - id: tesla_schedule_editor_sync_list
     alias: Tesla schedule editor - sync list
     description: >-
@@ -1290,14 +1403,8 @@ automation:
             {%- set c = state_attr('sensor.tesla_schedule_queue', 'charge_schedules') -%}{%- set c = c if c is list else state_attr('sensor.tesla_charge_schedules', 'schedules') -%}{{ c if c is list else [] -}}
           opts: >-
             {%- macro where(s) -%}
-            {%- set z = namespace(best='', d=99999) -%}
-            {%- for zone in states.zone if zone.attributes.latitude is defined -%}
-            {%- set d = distance(s.latitude, s.longitude, zone.entity_id) -%}
-            {%- if d is number and d <= [zone.attributes.radius | default(100) / 1000, 0.5] | max and d < z.d -%}
-            {%- set z.best = zone.name -%}{%- set z.d = d -%}{%- endif -%}{%- endfor -%}
-            {%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}
-            {%- if z.best == state_attr('zone.home', 'friendly_name') -%}{%- elif z.best -%}{{ ' · ' ~ z.best }}
-            {%- else -%}{{ ' · Other, ' ~ ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from Home' }}{%- endif -%}
+            {%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{%- set adr = (state_attr('sensor.tesla_schedule_addresses', 'addresses') or {}).get('%.4f,%.4f' | format(s.latitude, s.longitude)) if is_state('input_boolean.tesla_schedule_addresses', 'on') else none -%}
+            {%- if dh > [state_attr('zone.home', 'radius') | default(100) / 1000, 0.5] | max -%}{{ ' · ' ~ (adr if adr else ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from home') }}{%- endif -%}
             {%- endmacro -%}
             {%- macro charge(s) -%}
             {%- set rq = reqs.get(s.id | string) -%}
@@ -1404,8 +1511,8 @@ automation:
       - variables:
           loc_keep: >-
             {%- if s.latitude is defined and loc_zone == '' -%}
-            {%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}
-            📍 Keep: Other, {{ (dh | round(1)) if dh < 10 else (dh | round(0) | int) }} km from Home
+            {%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{%- set adr = (state_attr('sensor.tesla_schedule_addresses', 'addresses') or {}).get('%.4f,%.4f' | format(s.latitude, s.longitude)) if is_state('input_boolean.tesla_schedule_addresses', 'on') else none -%}
+            📍 Keep: {{ adr if adr else ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from home' }}
             {%- endif -%}
       - variables:
           loc_options: "{{ zone_names + ([loc_keep] if loc_keep else []) }}"
