@@ -148,7 +148,7 @@ template:
           requests: "{{ requests }}"
           saved_at: "{{ saved_at }}"
 
-  # Street addresses of schedule locations away from home: {"<lat>,<lon>" (4 decimals): "Street 1, Town"}, filled by
+  # Street addresses of schedule locations away from home: {"<lat>/<lon>" (4 decimals): "Street 1, Town"}, filled by
   # the "look up addresses" automation (opt in: input_boolean.tesla_schedule_addresses). "" = nothing found there.
   # Locations no schedule uses any more are dropped. Kept across Home Assistant restarts.
   - triggers:
@@ -166,7 +166,7 @@ template:
               {%- set l = state_attr('sensor.tesla_schedule_queue', kind ~ '_schedules') -%}
               {%- if l is list -%}{%- set ns.lists = ns.lists + 1 -%}{%- endif -%}
               {%- for s in (l if l is list else []) if s.latitude is defined -%}
-                {%- set ns.keys = ns.keys + ['%.4f,%.4f' | format(s.latitude, s.longitude)] -%}
+                {%- set ns.keys = ns.keys + ['%.4f/%.4f' | format(s.latitude, s.longitude)] -%}
               {%- endfor -%}
             {%- endfor -%}
             {%- for k, v in old.items() if k in ns.keys or ns.lists == 0 -%}{%- set ns.d = dict(ns.d, **{k: v}) -%}{%- endfor -%}
@@ -1362,7 +1362,7 @@ automation:
               {%- set l = state_attr('sensor.tesla_schedule_queue', kind ~ '_schedules') -%}
               {%- for s in (l if l is list else []) if s.latitude is defined
                   and distance(s.latitude, s.longitude, 'zone.home') > [state_attr('zone.home', 'radius') | default(100) / 1000, 0.5] | max -%}
-                {%- set k = '%.4f,%.4f' | format(s.latitude, s.longitude) -%}
+                {%- set k = '%.4f/%.4f' | format(s.latitude, s.longitude) -%}
                 {%- if k not in known and k not in ns.l -%}{%- set ns.l = ns.l + [k] -%}{%- endif -%}
               {%- endfor -%}
             {%- endfor -%}
@@ -1374,8 +1374,8 @@ automation:
                 geo: ~
             - action: rest_command.tesla_reverse_geocode
               data:
-                lat: "{{ repeat.item.split(',')[0] }}"
-                lon: "{{ repeat.item.split(',')[1] }}"
+                lat: "{{ repeat.item.split('/')[0] }}"
+                lon: "{{ repeat.item.split('/')[1] }}"
               response_variable: geo
               continue_on_error: true   # network trouble: try again on the next change
             - if:
@@ -1383,7 +1383,7 @@ automation:
               then:
                 - event: tesla_ble_schedule_address
                   event_data:
-                    key: "{{ repeat.item }}"
+                    key: "{{ repeat.item }}"   # "lat/lon": with a "," Home Assistant would turn it into a list
                     # A named place (shop, workplace) or street and number, then the town; "" if nothing is there
                     address: >-
                       {%- set c = geo.content -%}
@@ -1432,7 +1432,7 @@ automation:
             {%- set c = state_attr('sensor.tesla_schedule_queue', 'charge_schedules') -%}{%- set c = c if c is list else state_attr('sensor.tesla_charge_schedules', 'schedules') -%}{{ c if c is list else [] -}}
           opts: >-
             {%- macro where(s) -%}
-            {%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{%- set adr = (state_attr('sensor.tesla_schedule_addresses', 'addresses') or {}).get('%.4f,%.4f' | format(s.latitude, s.longitude)) if is_state('input_boolean.tesla_schedule_addresses', 'on') else none -%}
+            {%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{%- set adr = (state_attr('sensor.tesla_schedule_addresses', 'addresses') or {}).get('%.4f/%.4f' | format(s.latitude, s.longitude)) if is_state('input_boolean.tesla_schedule_addresses', 'on') else none -%}
             {%- set tag = namespace(t='') -%}{%- for k in ['work', 'home'] -%}{%- set v = state_attr('sensor.tesla_saved_locations', k) -%}{%- if v and distance(s.latitude, s.longitude, v[0], v[1]) <= 0.2 -%}{%- set tag.t = 'Tesla: ' ~ k -%}{%- endif -%}{%- endfor -%}
             {%- if dh > [state_attr('zone.home', 'radius') | default(100) / 1000, 0.5] | max -%}{{ ' · ' ~ (adr if adr else ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from home') ~ ((' (' ~ tag.t ~ ')') if tag.t else '') }}
             {%- elif tag.t -%}{{ ' · ' ~ tag.t }}{%- endif -%}
@@ -1542,7 +1542,7 @@ automation:
       - variables:
           loc_keep: >-
             {%- if s.latitude is defined and loc_zone == '' -%}
-            {%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{%- set adr = (state_attr('sensor.tesla_schedule_addresses', 'addresses') or {}).get('%.4f,%.4f' | format(s.latitude, s.longitude)) if is_state('input_boolean.tesla_schedule_addresses', 'on') else none -%}
+            {%- set dh = distance(s.latitude, s.longitude, 'zone.home') -%}{%- set adr = (state_attr('sensor.tesla_schedule_addresses', 'addresses') or {}).get('%.4f/%.4f' | format(s.latitude, s.longitude)) if is_state('input_boolean.tesla_schedule_addresses', 'on') else none -%}
             {%- set tag = namespace(t='') -%}{%- for k in ['work', 'home'] -%}{%- set v = state_attr('sensor.tesla_saved_locations', k) -%}{%- if v and distance(s.latitude, s.longitude, v[0], v[1]) <= 0.2 -%}{%- set tag.t = 'Tesla: ' ~ k -%}{%- endif -%}{%- endfor -%}
             📍 Keep: {{ (adr if adr else ((dh | round(1)) if dh < 10 else (dh | round(0) | int)) ~ ' km from home') ~ ((' (' ~ tag.t ~ ')') if tag.t else '') }}
             {%- endif -%}
