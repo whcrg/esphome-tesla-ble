@@ -259,6 +259,8 @@ namespace esphome
             DefrostState,
             ChargingState,
             ChargePortLatchState,
+            HomeLocation,
+            WorkLocation,
             LastUpdate,
             Count
         };
