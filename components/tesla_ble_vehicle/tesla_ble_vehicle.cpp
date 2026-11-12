@@ -1866,6 +1866,21 @@ namespace esphome
             {
               ESP_LOGI (TAG, "No data to set charge port latch");
             }
+            // Home and Work as set in the car ("latitude,longitude"), for matching schedule locations
+            const auto &cs = carserver_response.response_msg.vehicleData.charge_state;
+            char location[32];
+            if (cs.which_optional_home_location)
+            {
+              snprintf (location, sizeof (location), "%.5f,%.5f", cs.optional_home_location.home_location.latitude,
+                        cs.optional_home_location.home_location.longitude);
+              publishSensor (TextSensorId::HomeLocation, location);
+            }
+            if (cs.which_optional_work_location)
+            {
+              snprintf (location, sizeof (location), "%.5f,%.5f", cs.optional_work_location.work_location.latitude,
+                        cs.optional_work_location.work_location.longitude);
+              publishSensor (TextSensorId::WorkLocation, location);
+            }
             publishSensor (TextSensorId::LastUpdate, ctime(&timestamp));
           }
           else if (carserver_response.response_msg.vehicleData.has_drive_state)
